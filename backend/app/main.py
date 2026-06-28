@@ -14,13 +14,14 @@ from app.vnext.interview import router as vnext_interview_router  # this IS the 
 
 app = FastAPI(title="SViam Interview Lab", docs_url="/docs")
 
-# Allow the Next.js dev server (and any extra origins via CORS_ORIGINS) to call
-# the REST + WS endpoints.
-_default_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+# Allow the Next.js dev server to call the REST + WS endpoints. The regex permits
+# any localhost / 127.0.0.1 port so it works no matter which port the frontend
+# runs on (dev machines vary). Add deployed origins via CORS_ORIGINS (comma-sep).
 _extra = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_default_origins + _extra,
+    allow_origins=_extra,
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

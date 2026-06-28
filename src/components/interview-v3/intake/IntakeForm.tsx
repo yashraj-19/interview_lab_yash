@@ -152,6 +152,24 @@ export function IntakeForm() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autostart]);
 
+  // Perceived-performance + safety net for the auto-start. The first launch in
+  // dev compiles the room route on demand (can take 10–20s) — so after a short
+  // delay we reassure the candidate instead of looking frozen, and after a hard
+  // cap we drop to the manual form rather than spin forever.
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    if (autoState !== "starting") return;
+    const slowT = window.setTimeout(() => setSlow(true), 6000);
+    const giveUpT = window.setTimeout(() => {
+      autoStartedRef.current = false; // allow a manual retry
+      setAutoState("error");
+    }, 45000);
+    return () => {
+      window.clearTimeout(slowT);
+      window.clearTimeout(giveUpT);
+    };
+  }, [autoState]);
+
   // While auto-starting (or recovering from an error) show a clean preparing
   // screen instead of the setup form — the human never sees intake fields.
   if (autostart && autoState !== "error") {
@@ -164,6 +182,11 @@ export function IntakeForm() {
             Maya is loading the production incident. Use <strong>Chrome</strong> and
             allow the microphone when asked.
           </p>
+          {slow ? (
+            <p className="pt-1 text-xs text-[var(--muted-foreground)]">
+              First load takes a few extra seconds while the room compiles — hang tight.
+            </p>
+          ) : null}
         </div>
       </div>
     );
