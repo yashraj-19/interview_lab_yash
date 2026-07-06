@@ -17,6 +17,7 @@ Every emitted event is a flat ledger envelope assigned a server seq.
 from __future__ import annotations
 
 import asyncio
+import re
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
@@ -68,6 +69,73 @@ def _scripted_interviewer_line(signal: str, track: str | None = None) -> str:
 
 def _emit(session_id: str, actor: str, type_: str, payload: dict) -> dict:
     return STORE.append_event(session_id, actor, type_, payload)
+
+
+_REPEATED_PHRASES = re.compile(r"\b(repeat|again|rephrase|say that again|can you repeat)\b", re.IGNORECASE)
+_HELP_PHRASES = re.compile(r"\b(stuck|guide me|hint|confused|lost|don't get it|dont get it|need help|not sure)\b", re.IGNORECASE)
+_THINKING_PHRASES = re.compile(r"\b(let me think|give me a sec|give me a second|give me some time|hold on|one moment|thinking)\b", re.IGNORECASE)
+_META_AUDIO_PHRASES = re.compile(r"\b(hear me|can you hear me|didn't get you|didnt get you|hello)\b", re.IGNORECASE)
+
+
+def _classify_conversation_intent(text: str) -> str:
+    """Map a candidate utterance to a bounded intent we can handle deterministically."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return "answer"
+    if _REPEATED_PHRASES.search(cleaned):
+        return "repeat"
+    if _HELP_PHRASES.search(cleaned):
+        return "help"
+    if _THINKING_PHRASES.search(cleaned):
+        return "thinking"
+    if _META_AUDIO_PHRASES.search(cleaned):
+        return "meta_audio"
+    return "answer"
+
+
+def _intent_reply_text(intent: str) -> str | None:
+    replies = {
+        "repeat": "Let me repeat the goal more clearly so you can focus on the next concrete step.",
+        "help": "Let's narrow this to the next step: identify the failing condition and write the first guard or check in the code box.",
+        "thinking": "Take your time. I’ll wait while you work through it.",
+        "meta_audio": "I can hear you. Please continue and I’ll stay with you.",
+    }
+    return replies.get(intent)
+
+
+def _handle_candidate_text(session_id: str, text: str) -> list[dict]:
+    """Emit the candidate utterance plus a focused director event for recognized intents."""
+    seq_hint = (STORE.get_ledger(session_id).last_seq) + 1
+    out: list[dict] = [
+        _emit(
+            session_id,
+            "candidate",
+            "candidate.utterance",
+            {"lineId": f"cand-{seq_hint}", "text": str(text)},
+        )
+    ]
+    intent = _classify_conversation_intent(text)
+    if intent == "answer":
+        return out
+    out.append(
+        _emit(
+            session_id,
+            "system",
+            "conversation.intent.detected",
+            {"intent": intent, "text": str(text)},
+        )
+    )
+    reply_text = _intent_reply_text(intent)
+    if reply_text:
+        out.append(
+            _emit(
+                session_id,
+                "interviewer",
+                "interviewer.utterance",
+                {"lineId": f"dir-{seq_hint}", "text": reply_text},
+            )
+        )
+    return out
 
 
 def _incident_code_actions(session_id: str, code: str) -> list[dict]:
@@ -383,14 +451,8 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
                     await send(_emit(session_id, "system", "interviewer.cancelled", {"turnId": t}))
 
             elif mtype == "candidate.text":
-                seq_hint = (STORE.get_ledger(session_id).last_seq) + 1
-                ev = _emit(
-                    session_id,
-                    "candidate",
-                    "candidate.utterance",
-                    {"lineId": f"cand-{seq_hint}", "text": str(msg.get("text", ""))},
-                )
-                await send(ev)
+                for ev in _handle_candidate_text(session_id, str(msg.get("text", ""))):
+                    await send(ev)
 
             elif mtype == "candidate.code":
                 code = str(msg.get("code", ""))
