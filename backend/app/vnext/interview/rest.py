@@ -20,6 +20,35 @@ from .store import STORE, active_store_mode
 
 router = APIRouter(prefix="/vnext/interview", tags=["vnext-interview"])
 
+
+@router.patch("/sessions/{session_id}/hints")
+async def set_session_hints(session_id: str, hints: dict):
+    rec = STORE.get_session(session_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    rec = dict(rec)
+    rec["session_hints"] = hints
+    STORE.put_session(session_id, rec)
+    return {"ok": True}
+
+
+@router.post("/hints/provider/register")
+async def _register_provider():
+    # Dev-only demo provider
+    def demo_provider(session_id: str, intent: str):
+        if intent == "help":
+            return {"text": "Demo provider hint: try adding a guard.", "hint_for": intent, "hint_step": 1, "exhausted": False}
+        return None
+
+    register_hint_provider(demo_provider)
+    return {"ok": True}
+
+
+@router.post("/hints/provider/unregister")
+async def _unregister_provider():
+    unregister_hint_provider()
+    return {"ok": True}
+
 # "scripted" = deterministic seed (default). "llm" = OpenRouter-first adaptive
 # path with scripted fallback. Persisted on the session; ws/rest branch on it.
 SessionMode = Literal["scripted", "llm"]
