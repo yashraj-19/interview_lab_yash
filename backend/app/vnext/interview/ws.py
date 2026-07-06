@@ -17,7 +17,7 @@ Every emitted event is a flat ledger envelope assigned a server seq.
 from __future__ import annotations
 
 import asyncio
-import re
+from .intent import get_classifier
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
@@ -47,6 +47,7 @@ from .seed import (
     script_events_by_signal,
 )
 from .store import STORE
+from .session_init import SessionInitManager
 
 router = APIRouter()
 
@@ -71,26 +72,7 @@ def _emit(session_id: str, actor: str, type_: str, payload: dict) -> dict:
     return STORE.append_event(session_id, actor, type_, payload)
 
 
-_REPEATED_PHRASES = re.compile(r"\b(repeat|again|rephrase|say that again|can you repeat)\b", re.IGNORECASE)
-_HELP_PHRASES = re.compile(r"\b(stuck|guide me|hint|confused|lost|don't get it|dont get it|need help|not sure)\b", re.IGNORECASE)
-_THINKING_PHRASES = re.compile(r"\b(let me think|give me a sec|give me a second|give me some time|hold on|one moment|thinking)\b", re.IGNORECASE)
-_META_AUDIO_PHRASES = re.compile(r"\b(hear me|can you hear me|didn't get you|didnt get you|hello)\b", re.IGNORECASE)
-
-
-def _classify_conversation_intent(text: str) -> str:
-    """Map a candidate utterance to a bounded intent we can handle deterministically."""
-    cleaned = (text or "").strip()
-    if not cleaned:
-        return "answer"
-    if _REPEATED_PHRASES.search(cleaned):
-        return "repeat"
-    if _HELP_PHRASES.search(cleaned):
-        return "help"
-    if _THINKING_PHRASES.search(cleaned):
-        return "thinking"
-    if _META_AUDIO_PHRASES.search(cleaned):
-        return "meta_audio"
-    return "answer"
+_CLASSIFIER = get_classifier()
 
 
 def _intent_reply_text(intent: str) -> str | None:
@@ -114,7 +96,7 @@ def _handle_candidate_text(session_id: str, text: str) -> list[dict]:
             {"lineId": f"cand-{seq_hint}", "text": str(text)},
         )
     ]
-    intent = _classify_conversation_intent(text)
+    intent = _CLASSIFIER.classify(text, session_id)
     if intent == "answer":
         return out
     out.append(
@@ -386,6 +368,11 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
         }
     )
 
+    # Initialize session-init manager (do not auto-emit greeting here to
+    # preserve existing scripted event ordering; callers may register greeting
+    # later when appropriate).
+    session_init = SessionInitManager(session_id)
+
     # ── drive the session via inbound signals ──
     # A send lock serializes the main loop's sends with the background turn-
     # generation task's send (a websocket has one writer). active_turns maps a
@@ -420,6 +407,23 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
             if mtype == "advance.request":
                 signal = str(msg.get("signal", ""))
                 sess = STORE.get_session(session_id)
+                # Block advances until onboarding complete.
+                try:
+                    if not session_init.is_complete():
+                        # Remind candidate to finish onboarding; do not advance.
+                        await send(
+                            _emit(
+                                session_id,
+                                "interviewer",
+                                "interviewer.utterance",
+                                {"lineId": f"onboard-{STORE.get_ledger(session_id).last_seq + 1}",
+                                 "text": "Please complete the quick audio and readiness checks before we begin."},
+                            )
+                        )
+                        continue
+                except Exception:
+                    # keep going if session_init check fails
+                    pass
                 if sess and sess.get("mode") == "llm":
                     prelude, turn_id, phase = _advance_llm_prelude(session_id, signal)
                     for ev in prelude:
@@ -451,7 +455,30 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
                     await send(_emit(session_id, "system", "interviewer.cancelled", {"turnId": t}))
 
             elif mtype == "candidate.text":
-                for ev in _handle_candidate_text(session_id, str(msg.get("text", ""))):
+                text_str = str(msg.get("text", ""))
+                # Inspect intent first to update session-init state when appropriate.
+                try:
+                    intent = _CLASSIFIER.classify(text_str, session_id)
+                except Exception:
+                    intent = "answer"
+
+                # quick audio/problem heuristics
+                low = (text_str or "").lower()
+                if "muted" in low or "no sound" in low or "can't hear" in low or "cannot hear" in low:
+                    ev = session_init.mark_audio_problem(text_str)
+                    await send(ev)
+                elif intent == "meta_audio":
+                    # candidate checking connectivity → mark audio ok
+                    ev = session_init.mark_audio_ok()
+                    await send(ev)
+
+                # explicit readiness phrases
+                ready_phrases = ("ready", "i'm ready", "im ready", "i am ready")
+                if any(p in low for p in ready_phrases):
+                    ev = session_init.mark_ready()
+                    await send(ev)
+
+                for ev in _handle_candidate_text(session_id, text_str):
                     await send(ev)
 
             elif mtype == "candidate.code":

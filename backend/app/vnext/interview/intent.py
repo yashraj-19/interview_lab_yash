@@ -1,0 +1,80 @@
+"""Pluggable IntentClassifier for conversational intent detection.
+
+This module provides a small interface for intent classification. The default
+implementation is a lightweight rule-based classifier (for offline/dev use).
+A dynamic provider (LLM) can be registered at runtime via
+`IntentClassifier.register_provider(callable)`; the callable must accept
+(text, session_id) and return an intent string.
+
+Do NOT perform network calls during import; provider calls happen at runtime.
+"""
+from __future__ import annotations
+
+import re
+from typing import Callable, Optional
+
+
+class IntentClassifier:
+    """Pluggable classifier. Use `.classify(text, session_id)` to get intent."""
+
+    def __init__(self) -> None:
+        self._provider: Optional[Callable[[str, str], str]] = None
+        self._fallback = RuleBasedIntentClassifier()
+
+    def register_provider(self, fn: Callable[[str, str], str]) -> None:
+        """Register a dynamic provider callable(text, session_id) -> intent."""
+        self._provider = fn
+
+    def unregister_provider(self) -> None:
+        self._provider = None
+
+    def classify(self, text: str, session_id: str) -> str:
+        # Provider has priority; fall back to rule-based.
+        if self._provider is not None:
+            try:
+                intent = self._provider(text, session_id)
+                if isinstance(intent, str) and intent:
+                    return intent
+            except Exception:
+                # provider errors must not crash the flow; fall back
+                pass
+        return self._fallback.classify(text)
+
+
+class RuleBasedIntentClassifier:
+    """Lightweight rule-based fallback. Keep patterns minimal and maintainable.
+
+    This exists only as a safe offline fallback. It intentionally does not
+    attempt exhaustive NLP — that's the provider's job.
+    """
+
+    def __init__(self) -> None:
+        self._repeat_rx = re.compile(r"\b(repeat|again|rephrase|say that again|can you repeat)\b", re.IGNORECASE)
+        self._help_rx = re.compile(r"\b(stuck|guide me|hint|confused|lost|don't get it|dont get it|need help|not sure)\b", re.IGNORECASE)
+        self._thinking_rx = re.compile(r"\b(let me think|give me a sec|give me a second|give me some time|hold on|one moment|thinking|wait)\b", re.IGNORECASE)
+        self._meta_audio_rx = re.compile(r"\b(hear me|can you hear me|didn't get you|didnt get you|hello|hi|hey)\b", re.IGNORECASE)
+
+    def classify(self, text: str) -> str:
+        t = (text or "").strip()
+        if not t:
+            return "answer"
+        if self._repeat_rx.search(t):
+            return "repeat"
+        if self._help_rx.search(t):
+            return "help"
+        if self._thinking_rx.search(t):
+            return "thinking"
+        if self._meta_audio_rx.search(t):
+            return "meta_audio"
+        return "answer"
+
+
+# Module singleton for easy import/use in ws.py
+_DEFAULT_CLASSIFIER = IntentClassifier()
+
+
+def get_classifier() -> IntentClassifier:
+    return _DEFAULT_CLASSIFIER
+
+
+__all__ = ["IntentClassifier", "get_classifier"]
