@@ -50,6 +50,7 @@ from .store import STORE
 from .session_init import SessionInitManager
 from .hint_ladder import next_hint
 from .hint_provider import get_hint_for
+from .pause_policy import get_pause_for
 
 router = APIRouter()
 
@@ -87,8 +88,12 @@ def _intent_reply_text(intent: str) -> str | None:
     return replies.get(intent)
 
 
-def _handle_candidate_text(session_id: str, text: str) -> list[dict]:
-    """Emit the candidate utterance plus a focused director event for recognized intents."""
+def _handle_candidate_text(session_id: str, text: str, force_immediate: bool = False) -> list[dict]:
+    """Emit the candidate utterance plus a focused director event for recognized intents.
+    
+    Backchannels ("yeah", "okay", etc.) are logged but don't emit hints.
+    Cut-in words ("wait", "stop", etc.) force immediate cancellation + hint.
+    """
     seq_hint = (STORE.get_ledger(session_id).last_seq) + 1
     out: list[dict] = [
         _emit(
@@ -99,6 +104,23 @@ def _handle_candidate_text(session_id: str, text: str) -> list[dict]:
         )
     ]
     intent = _CLASSIFIER.classify(text, session_id)
+    
+    # Backchannel: no hint needed, just log.
+    if intent == "backchannel":
+        out.append(
+            _emit(
+                session_id,
+                "system",
+                "conversation.intent.detected",
+                {"intent": intent, "text": str(text), "is_backchannel": True},
+            )
+        )
+        return out
+    
+    # Cut-in: urgent interrupt, force immediate.
+    if intent == "cut_in":
+        force_immediate = True
+    
     if intent == "answer":
         return out
     out.append(
@@ -112,10 +134,31 @@ def _handle_candidate_text(session_id: str, text: str) -> list[dict]:
     # Resolve hint via the pluggable provider → session override → fallback.
     hint_payload = get_hint_for(session_id, intent)
     if hint_payload is not None:
-        payload = {"lineId": f"dir-{seq_hint}", "text": hint_payload.get("text", ""),
-                   "hint_for": hint_payload.get("hint_for"), "hint_step": hint_payload.get("hint_step"),
-                   "exhausted": hint_payload.get("exhausted", False)}
-        out.append(_emit(session_id, "interviewer", "interviewer.utterance", payload))
+        # If a recent candidate barge-in cancelled an interviewer, the UX expects
+        # an immediate corrective hint — bypass pause policies when forced.
+        if force_immediate:
+            payload = {"lineId": f"dir-{seq_hint}", "text": hint_payload.get("text", ""),
+                       "hint_for": hint_payload.get("hint_for"), "hint_step": hint_payload.get("hint_step"),
+                       "exhausted": hint_payload.get("exhausted", False)}
+            out.append(_emit(session_id, "interviewer", "interviewer.utterance", payload))
+            return out
+
+        pause_ms = 0
+        try:
+            pause_ms = int(get_pause_for(session_id, intent) or 0)
+        except Exception:
+            pause_ms = 0
+
+        if pause_ms > 0:
+            # schedule interviewer utterance later; emit a system.pause.scheduled event
+            out.append(_emit(session_id, "system", "system.pause.scheduled", {"intent": intent, "delay_ms": pause_ms}))
+            # return a scheduled marker that the WS loop will pick up and schedule
+            out.append({"scheduled_interviewer": {"payload": hint_payload, "delay_ms": pause_ms}})
+        else:
+            payload = {"lineId": f"dir-{seq_hint}", "text": hint_payload.get("text", ""),
+                       "hint_for": hint_payload.get("hint_for"), "hint_step": hint_payload.get("hint_step"),
+                       "exhausted": hint_payload.get("exhausted", False)}
+            out.append(_emit(session_id, "interviewer", "interviewer.utterance", payload))
     return out
 
 
@@ -380,6 +423,7 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
     send_lock = asyncio.Lock()
     active_turns: dict[str, asyncio.Task] = {}
     cancelled_turns: set[str] = set()
+    scheduled_interviewer_tasks: list[asyncio.Task] = []
 
     async def send(ev: dict) -> None:
         async with send_lock:
@@ -395,6 +439,25 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
         # Emit only if it wasn't cancelled while generating / just before emit.
         if ev is not None and turn_id not in cancelled_turns:
             await send(ev)
+
+    async def _run_scheduled_interviewer(session_id: str, payload: dict, delay_ms: int) -> None:
+        # Sleep and then emit the interviewer. Append event at send-time.
+        try:
+            await asyncio.sleep(delay_ms / 1000.0)
+            ev = _emit(session_id, "interviewer", "interviewer.utterance", {"lineId": f"dir-{STORE.get_ledger(session_id).last_seq + 1}", **payload})
+            await send(ev)
+            # emit completed marker
+            await send(_emit(session_id, "system", "system.pause.completed", {"intent": payload.get("hint_for"), "delay_ms": delay_ms}))
+        except asyncio.CancelledError:
+            return
+        finally:
+            # remove this task from the scheduling registry if present
+            try:
+                this_task = asyncio.current_task()
+                if this_task in scheduled_interviewer_tasks:
+                    scheduled_interviewer_tasks.remove(this_task)
+            except Exception:
+                pass
 
     try:
         while True:
@@ -452,14 +515,46 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
                     if task is not None and not task.done():
                         task.cancel()
                     await send(_emit(session_id, "system", "interviewer.cancelled", {"turnId": t}))
+                # Also cancel any scheduled interviewer utterances
+                for task in list(scheduled_interviewer_tasks):
+                    meta = getattr(task, "scheduled_meta", None) or {}
+                    try:
+                        task.cancel()
+                        await send(_emit(session_id, "system", "system.pause.cancelled", {"intent": meta.get("payload", {}).get("hint_for"), "delay_ms": meta.get("delay_ms")}))
+                    except Exception:
+                        pass
+                scheduled_interviewer_tasks.clear()
 
             elif mtype == "candidate.text":
                 text_str = str(msg.get("text", ""))
-                # Inspect intent first to update session-init state when appropriate.
+                # Inspect intent first to determine if urgent interrupt.
                 try:
                     intent = _CLASSIFIER.classify(text_str, session_id)
                 except Exception:
                     intent = "answer"
+
+                # Determine if this is an urgent interrupt (cut-in word like "wait", "stop").
+                # Only cancel scheduled interviewer tasks on urgent interrupts, not on every text.
+                is_urgent_interrupt = intent == "cut_in"
+                cancelled_any = False
+                
+                if is_urgent_interrupt:
+                    # Cut-in: aggressively cancel all scheduled interviewer utterances.
+                    for task in list(scheduled_interviewer_tasks):
+                        meta = getattr(task, "scheduled_meta", None) or {}
+                        try:
+                            task.cancel()
+                            cancelled_any = True
+                            await send(_emit(session_id, "system", "system.pause.cancelled", 
+                                           {"intent": meta.get("payload", {}).get("hint_for"), 
+                                            "delay_ms": meta.get("delay_ms"),
+                                            "reason": "cut_in"}))
+                        except Exception:
+                            pass
+                    scheduled_interviewer_tasks.clear()
+                    # Emit barge-in latency marker (for monitoring).
+                    await send(_emit(session_id, "system", "barge_in.detected", 
+                                   {"intent": intent, "text": text_str}))
 
                 # quick audio/problem heuristics
                 low = (text_str or "").lower()
@@ -477,7 +572,22 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
                     ev = session_init.mark_ready()
                     await send(ev)
 
-                for ev in _handle_candidate_text(session_id, text_str):
+                # Pass force_immediate flag if this was an urgent interrupt.
+                for ev in _handle_candidate_text(session_id, text_str, force_immediate=cancelled_any):
+                    # scheduled interviewer markers are dicts with key 'scheduled_interviewer'
+                    if isinstance(ev, dict) and ev.get("scheduled_interviewer"):
+                        si = ev["scheduled_interviewer"]
+                        payload = si.get("payload") or {}
+                        delay_ms = int(si.get("delay_ms", 0) or 0)
+                        # create background task to run scheduled interviewer
+                        task = asyncio.create_task(_run_scheduled_interviewer(session_id, payload, delay_ms))
+                        # attach metadata for cancellation reporting
+                        try:
+                            setattr(task, "scheduled_meta", {"payload": payload, "delay_ms": delay_ms})
+                        except Exception:
+                            pass
+                        scheduled_interviewer_tasks.append(task)
+                        continue
                     await send(ev)
 
             elif mtype == "candidate.code":

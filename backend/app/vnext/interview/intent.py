@@ -49,15 +49,39 @@ class RuleBasedIntentClassifier:
     """
 
     def __init__(self) -> None:
+        # Backchannel words: common filler sounds that don't require a hint.
+        self._backchannel_rx = re.compile(
+            r"^\s*(?:hmm|yeah|okay|ok|right|uh-huh|mhm|i see|got it|yep|sure|ah)\s*$",
+            re.IGNORECASE,
+        )
+        # Cut-in words: explicit interrupts that should immediately cancel a scheduled utterance.
+        self._cut_in_rx = re.compile(
+            r"^\s*(?:wait|stop|hold|hang|sorry|actually|no|hey|pause|excuse)\b",
+            re.IGNORECASE,
+        )
         self._repeat_rx = re.compile(r"\b(repeat|again|rephrase|say that again|can you repeat)\b", re.IGNORECASE)
         self._help_rx = re.compile(r"\b(stuck|guide me|hint|confused|lost|don't get it|dont get it|need help|not sure)\b", re.IGNORECASE)
-        self._thinking_rx = re.compile(r"\b(let me think|give me a sec|give me a second|give me some time|hold on|one moment|thinking|wait)\b", re.IGNORECASE)
+        self._thinking_rx = re.compile(r"\b(let me think|give me a sec|give me a second|give me some time|hold on|one moment|thinking|think)\b", re.IGNORECASE)
         self._meta_audio_rx = re.compile(r"\b(hear me|can you hear me|didn't get you|didnt get you|hello|hi|hey)\b", re.IGNORECASE)
+
+    def is_backchannel(self, text: str) -> bool:
+        """True if the text is a pure backchannel (no intent to be handled)."""
+        return bool(self._backchannel_rx.search(text or ""))
+
+    def is_cut_in(self, text: str) -> bool:
+        """True if the text opens with an explicit interrupt word (barge-in signal)."""
+        return bool(self._cut_in_rx.search(text or ""))
 
     def classify(self, text: str) -> str:
         t = (text or "").strip()
         if not t:
             return "answer"
+        # Backchannel: don't emit a handler hint for pure fillers.
+        if self.is_backchannel(t):
+            return "backchannel"
+        # Cut-in: urgent interrupt signal.
+        if self.is_cut_in(t):
+            return "cut_in"
         if self._repeat_rx.search(t):
             return "repeat"
         if self._help_rx.search(t):

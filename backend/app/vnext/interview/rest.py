@@ -17,6 +17,8 @@ from .models import Intake
 from .phase_controller import PhaseController, TransitionContext
 from .seed import generate_rubric
 from .store import STORE, active_store_mode
+from .hint_provider import register_hint_provider, unregister_hint_provider
+from .pause_policy import register_pause_provider, unregister_pause_provider
 
 router = APIRouter(prefix="/vnext/interview", tags=["vnext-interview"])
 
@@ -47,6 +49,35 @@ async def _register_provider():
 @router.post("/hints/provider/unregister")
 async def _unregister_provider():
     unregister_hint_provider()
+    return {"ok": True}
+
+
+@router.patch("/sessions/{session_id}/pause_policies")
+async def set_session_pause_policies(session_id: str, policies: dict):
+    rec = STORE.get_session(session_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    rec = dict(rec)
+    rec["pause_policies"] = policies
+    STORE.put_session(session_id, rec)
+    return {"ok": True}
+
+
+@router.post("/pause/provider/register")
+async def _register_pause_provider():
+    # demo provider returns 500ms for 'help'
+    def demo_pause(session_id: str, intent: str):
+        if intent == "help":
+            return 500
+        return 0
+
+    register_pause_provider(demo_pause)
+    return {"ok": True}
+
+
+@router.post("/pause/provider/unregister")
+async def _unregister_pause_provider():
+    unregister_pause_provider()
     return {"ok": True}
 
 # "scripted" = deterministic seed (default). "llm" = OpenRouter-first adaptive
