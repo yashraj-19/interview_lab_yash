@@ -48,6 +48,7 @@ from .seed import (
 )
 from .store import STORE
 from .session_init import SessionInitManager
+from .hint_ladder import next_hint
 
 router = APIRouter()
 
@@ -107,16 +108,13 @@ def _handle_candidate_text(session_id: str, text: str) -> list[dict]:
             {"intent": intent, "text": str(text)},
         )
     )
-    reply_text = _intent_reply_text(intent)
-    if reply_text:
-        out.append(
-            _emit(
-                session_id,
-                "interviewer",
-                "interviewer.utterance",
-                {"lineId": f"dir-{seq_hint}", "text": reply_text},
-            )
-        )
+    # Use the hint ladder to provide progressive, never-revealing hints.
+    hint_payload = next_hint(session_id, intent)
+    if hint_payload is not None:
+        payload = {"lineId": f"dir-{seq_hint}", "text": hint_payload.get("text", ""),
+                   "hint_for": hint_payload.get("hint_for"), "hint_step": hint_payload.get("hint_step"),
+                   "exhausted": hint_payload.get("exhausted", False)}
+        out.append(_emit(session_id, "interviewer", "interviewer.utterance", payload))
     return out
 
 
