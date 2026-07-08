@@ -22,6 +22,7 @@ import {
 import { ScorecardPanel } from "./ScorecardPanel";
 import { EvidenceDrawer } from "./EvidenceDrawer";
 import { CopyReviewLink } from "./CopyReviewLink";
+import { computeConversationMetrics, type AnyEvent } from "@/lib/interview-v3/metrics";
 
 const btnCls =
   "rounded-md border border-[var(--muted)] px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--muted)]/20 disabled:opacity-40";
@@ -170,6 +171,7 @@ export function ReviewWorkspace({ sessionId }: { sessionId: string }) {
   const transcript = selectTranscript(ledger);
   const codeState = selectCode(ledger);
   const runs = selectRuns(ledger);
+  const metrics = computeConversationMetrics(ledger as unknown as AnyEvent[]);
 
   const visibleTranscript = evidenceOnly
     ? transcript.filter((t) => citedSeqs.has(t.seq))
@@ -237,6 +239,67 @@ export function ReviewWorkspace({ sessionId }: { sessionId: string }) {
               {reviewModel.invalidEvidenceCount} unresolved evidence citation(s) detected.
             </p>
           ) : null}
+
+          {/* Conversation quality — computed from ledger timestamps, no extra
+              instrumentation. The numbers a real interviewer would be judged on. */}
+          <section className="space-y-2">
+            <h2 className="text-sm font-semibold uppercase tracking-widest text-[var(--muted-foreground)]">
+              Conversation quality
+            </h2>
+            <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 rounded-md border border-[var(--muted)] p-3 text-xs sm:grid-cols-3">
+              <div>
+                <dt className="text-[var(--muted-foreground)]">Response gap (median)</dt>
+                <dd className="font-mono tabular-nums">
+                  {metrics.responseGapMedianMs !== null ? `${(metrics.responseGapMedianMs / 1000).toFixed(1)}s` : "—"}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-[var(--muted-foreground)]">Response gap (p90)</dt>
+                <dd className="font-mono tabular-nums">
+                  {metrics.responseGapP90Ms !== null ? `${(metrics.responseGapP90Ms / 1000).toFixed(1)}s` : "—"}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-[var(--muted-foreground)]">Turn generation (median)</dt>
+                <dd className="font-mono tabular-nums">
+                  {metrics.generationMedianMs !== null ? `${(metrics.generationMedianMs / 1000).toFixed(1)}s` : "—"}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-[var(--muted-foreground)]">Barge-ins honored</dt>
+                <dd className="font-mono tabular-nums">{metrics.bargeIns} / {metrics.cancelledTurns} cancelled</dd>
+              </div>
+              <div>
+                <dt className="text-[var(--muted-foreground)]">Hints (deepest rung)</dt>
+                <dd className="font-mono tabular-nums">
+                  {metrics.hintCount}{metrics.maxHintStep ? ` (rung ${metrics.maxHintStep})` : ""}
+                  {metrics.throttledHints ? ` · ${metrics.throttledHints} throttled` : ""}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-[var(--muted-foreground)]">Silence nudges</dt>
+                <dd className="font-mono tabular-nums">{metrics.silenceNudges}</dd>
+              </div>
+              <div>
+                <dt className="text-[var(--muted-foreground)]">Guarded lines</dt>
+                <dd className="font-mono tabular-nums">
+                  {metrics.guardedLines}{metrics.stallRecoveries ? ` · ${metrics.stallRecoveries} stall-recovered` : ""}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-[var(--muted-foreground)]">Talk balance (cand/int)</dt>
+                <dd className="font-mono tabular-nums">{metrics.candidateUtterances} / {metrics.interviewerUtterances}</dd>
+              </div>
+              <div>
+                <dt className="text-[var(--muted-foreground)]">Run progression</dt>
+                <dd className="font-mono tabular-nums">
+                  {metrics.runProgression.length
+                    ? metrics.runProgression.map((r) => `${r.passed}/${r.total}`).join(" → ")
+                    : "—"}
+                </dd>
+              </div>
+            </dl>
+          </section>
         </div>
 
         <div className="space-y-6">

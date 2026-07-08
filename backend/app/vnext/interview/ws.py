@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 
 from .intent import get_classifier
 
@@ -71,6 +72,28 @@ def _emit(session_id: str, actor: str, type_: str, payload: dict) -> dict:
 
 
 _CLASSIFIER = get_classifier()
+
+# ── dead-air policy (think-aloud research: Ericsson & Simon; Rowe wait time) ──
+# Silence is NOT struggle: after a question, the candidate gets a hard-quiet
+# grace period; prolonged joint silence earns a NEUTRAL "keep talking" nudge
+# (never a hint — hints are earned via the help ladder), then one check-in.
+# Constants are module-level so tests can shrink them.
+_SILENCE_POLL_SECS = 5.0
+_SILENCE_FIRST_SECS = 25.0
+_SILENCE_SECOND_SECS = 50.0
+_SILENCE_NUDGES = (
+    "Talk me through what you're thinking — half-formed is fine.",
+    "Still with me? Say what you're weighing, or tell me if you'd like the question rephrased.",
+)
+# Phases where the interview is actually running (nudges never fire in setup).
+_ACTIVE_PHASES = frozenset({
+    "intro", "resume_calibration", "problem_framing", "coding",
+    "debugging", "optimization", "wrap_up",
+})
+
+# An LLM turn that produces nothing for this long is stalled: recover with the
+# deterministic scenario line so the candidate never stares at dead air.
+_STALL_TIMEOUT_SECS = 12.0
 
 # Onboarding readiness must be a whole word — bare substring matching marked a
 # candidate ready when they said "I ALREADY tried that". A negation within a few
@@ -507,21 +530,80 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
     active_turns: dict[str, asyncio.Task] = {}
     cancelled_turns: set[str] = set()
     scheduled_interviewer_tasks: list[asyncio.Task] = []
+    # Dead-air tracking: last time each side did anything (monotonic seconds).
+    activity = {"candidate": time.monotonic(), "interviewer": time.monotonic()}
+    nudge_state = {"level": 0}
 
     async def send(ev: dict) -> None:
+        if ev.get("type") == "interviewer.utterance":
+            activity["interviewer"] = time.monotonic()
         async with send_lock:
             await websocket.send_json(ev)
 
     async def run_turn(signal: str, phase: str, turn_id: str) -> None:
+        # Generation runs as its own task so the stall timeout is decided by
+        # asyncio.wait (deterministic) rather than cancellation semantics —
+        # _generate_turn deliberately swallows CancelledError for barge-in,
+        # which would defeat a plain wait_for timeout.
+        gen = asyncio.create_task(_generate_turn(session_id, signal, phase, turn_id))
         try:
-            ev = await _generate_turn(session_id, signal, phase, turn_id)
+            done, _ = await asyncio.wait({gen}, timeout=_STALL_TIMEOUT_SECS)
+            if gen in done:
+                try:
+                    ev = gen.result()
+                except Exception:
+                    ev = None
+            else:
+                # Stall recovery: the LLM hung — abandon it and fall back to the
+                # deterministic scenario line so the turn ALWAYS completes audibly.
+                gen.cancel()
+                rec_s = STORE.get_session(session_id)
+                text = _scripted_interviewer_line(signal, rec_s.get("track") if rec_s else None)
+                seq_s = STORE.get_ledger(session_id).last_seq + 1
+                ev = _emit(
+                    session_id, "interviewer", "interviewer.utterance",
+                    {"lineId": f"llm-{seq_s}", "text": text, "turnId": turn_id,
+                     "stallRecovered": True},
+                )
         except asyncio.CancelledError:
+            gen.cancel()  # barge-in cancelled this turn — kill generation too
             return
         finally:
             active_turns.pop(turn_id, None)
         # Emit only if it wasn't cancelled while generating / just before emit.
         if ev is not None and turn_id not in cancelled_turns:
             await send(ev)
+
+    async def _silence_watchdog() -> None:
+        """Joint-silence ladder: neutral think-aloud nudge, then one check-in.
+
+        Fires only while the interview is in an active phase, nothing is being
+        generated, onboarding (if any) is done, and BOTH sides have been quiet —
+        so it can never talk over the candidate or an in-flight turn. Resets
+        whenever the candidate does anything (see the message loop)."""
+        while True:
+            await asyncio.sleep(_SILENCE_POLL_SECS)
+            if not onboarding_done or active_turns or scheduled_interviewer_tasks:
+                continue
+            rec_w = STORE.get_session(session_id)
+            if not rec_w or rec_w.get("phase") not in _ACTIVE_PHASES:
+                continue
+            now = time.monotonic()
+            quiet = min(now - activity["candidate"], now - activity["interviewer"])
+            level = nudge_state["level"]
+            threshold = _SILENCE_FIRST_SECS if level == 0 else _SILENCE_SECOND_SECS
+            if level >= len(_SILENCE_NUDGES) or quiet < threshold:
+                continue
+            nudge_state["level"] = level + 1
+            await send(
+                _emit(
+                    session_id, "interviewer", "interviewer.utterance",
+                    {"lineId": f"nudge-{STORE.get_ledger(session_id).last_seq + 1}",
+                     "text": _SILENCE_NUDGES[level], "nudgeLevel": level + 1},
+                )
+            )
+
+    watchdog_task = asyncio.create_task(_silence_watchdog())
 
     async def _run_scheduled_interviewer(
         session_id: str, payload: dict, delay_ms: int, trigger_seq: int = 0
@@ -563,6 +645,11 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
             if not isinstance(msg, dict):
                 continue
             mtype = msg.get("type")
+
+            # Any client-origin message is candidate activity: the silence
+            # ladder resets and a fresh episode begins.
+            activity["candidate"] = time.monotonic()
+            nudge_state["level"] = 0
 
             if mtype == "advance.request":
                 signal = str(msg.get("signal", ""))
@@ -789,7 +876,11 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
             pass
         return
     finally:
-        # Never leak a background generation task past the connection.
+        # Never leak a background task past the connection.
+        watchdog_task.cancel()
         for task in list(active_turns.values()):
+            if not task.done():
+                task.cancel()
+        for task in list(scheduled_interviewer_tasks):
             if not task.done():
                 task.cancel()

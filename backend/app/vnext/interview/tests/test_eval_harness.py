@@ -17,6 +17,15 @@ from app.vnext.interview.pause_policy import get_pause_for, register_pause_provi
 from app.vnext.interview.store import InMemoryInterviewStore
 
 
+def _later():
+    """A clock 60s in the future: steps past the hint-gaming read-time
+    throttle so escalation tests exercise the ladder, not the throttle
+    (the throttle has its own tests)."""
+    import time
+    return int(time.time() * 1000) + 60_000
+
+
+
 @pytest.fixture
 def store():
     return InMemoryInterviewStore()
@@ -138,7 +147,7 @@ class TestNeverRevealHintEscalation:
         session_id = store.create_session({"role": "SDE", "seniority": "mid"})
         ledger = store.get_ledger(session_id)
 
-        hint = next_hint(session_id, "help", store)
+        hint = next_hint(session_id, "help", store, now_ms=_later())
         assert hint is not None
         assert hint["attempt"] == 1
         assert hint["exhausted"] is False
@@ -154,7 +163,7 @@ class TestNeverRevealHintEscalation:
         store.append_event(session_id, "interviewer", "interviewer.utterance", 
                           {"hint_for": "help", "hint_step": 1, "attempt": 1})
         
-        hint = next_hint(session_id, "help", store)
+        hint = next_hint(session_id, "help", store, now_ms=_later())
         assert hint is not None
         assert hint["attempt"] == 2
         assert hint["exhausted"] is False
@@ -168,7 +177,7 @@ class TestNeverRevealHintEscalation:
         store.append_event(session_id, "interviewer", "interviewer.utterance", 
                           {"hint_for": "help", "hint_step": 2, "attempt": 2})
         
-        hint = next_hint(session_id, "help", store)
+        hint = next_hint(session_id, "help", store, now_ms=_later())
         assert hint is not None
         assert hint["attempt"] == 3
         assert hint["exhausted"] is True  # final reveal
@@ -178,21 +187,21 @@ class TestNeverRevealHintEscalation:
         session_id = store.create_session({"role": "SDE", "seniority": "mid"})
         
         # Emit hint for "help"
-        hint_help_1 = next_hint(session_id, "help", store)
+        hint_help_1 = next_hint(session_id, "help", store, now_ms=_later())
         assert hint_help_1["attempt"] == 1
         
         # Hint for "repeat" should still be at attempt 1 (independent)
-        hint_repeat_1 = next_hint(session_id, "repeat", store)
+        hint_repeat_1 = next_hint(session_id, "repeat", store, now_ms=_later())
         assert hint_repeat_1["attempt"] == 1
         
         # Emit another hint for "help"
         store.append_event(session_id, "interviewer", "interviewer.utterance", 
                           {"hint_for": "help", "hint_step": 1, "attempt": 1})
-        hint_help_2 = next_hint(session_id, "help", store)
+        hint_help_2 = next_hint(session_id, "help", store, now_ms=_later())
         assert hint_help_2["attempt"] == 2
         
         # "repeat" still at 1
-        hint_repeat_still_1 = next_hint(session_id, "repeat", store)
+        hint_repeat_still_1 = next_hint(session_id, "repeat", store, now_ms=_later())
         assert hint_repeat_still_1["attempt"] == 1
 
     def test_unknown_intent_returns_none(self, store):
@@ -210,7 +219,7 @@ class TestNeverRevealHintEscalation:
             rungs = _HINTS[intent]
             for _ in range(len(rungs)):  # exhaust the ladder
                 store.append_event(session_id, "interviewer", "interviewer.utterance", {"hint_for": intent})
-            hint = next_hint(session_id, intent, store)  # attempt = len+1
+            hint = next_hint(session_id, intent, store, now_ms=_later())  # attempt = len+1
             assert hint["text"] == rungs[-1], f"{intent} should clamp to its final rung"
             assert "move on" not in hint["text"].lower()
             assert "still stuck" not in hint["text"].lower()
@@ -222,7 +231,7 @@ class TestNeverRevealHintEscalation:
             session_id = store.create_session({"role": "SDE"})
             for _ in range(len(_HINTS[intent])):
                 store.append_event(session_id, "interviewer", "interviewer.utterance", {"hint_for": intent})
-            hint = next_hint(session_id, intent, store)
+            hint = next_hint(session_id, intent, store, now_ms=_later())
             assert "move on" in hint["text"].lower()
             assert hint["exhausted"] is True
 
@@ -232,7 +241,7 @@ class TestNeverRevealHintEscalation:
         h1 = next_hint(session_id, "help", store, ladder=["A", "B"])
         assert (h1["text"], h1["hint_step"], h1["exhausted"]) == ("A", 1, False)
         store.append_event(session_id, "interviewer", "interviewer.utterance", {"hint_for": "help"})
-        h2 = next_hint(session_id, "help", store, ladder=["A", "B"])
+        h2 = next_hint(session_id, "help", store, ladder=["A", "B"], now_ms=_later())
         assert (h2["text"], h2["hint_step"], h2["exhausted"]) == ("B", 2, True)
 
 
@@ -256,7 +265,7 @@ class TestSessionOverrideAndReadiness:
         h1 = get_hint_for(sid, "help")
         assert (h1["text"], h1["hint_step"]) == ("first custom hint", 1)
         STORE.append_event(sid, "interviewer", "interviewer.utterance", {"hint_for": "help"})
-        h2 = get_hint_for(sid, "help")
+        h2 = get_hint_for(sid, "help", now_ms=_later())
         assert (h2["text"], h2["hint_step"]) == ("second custom hint", 2)
         assert h2["exhausted"] is True
 
@@ -420,7 +429,7 @@ class TestProductionRobustness:
                           {"hint_for": "help", "hint_step": 1, "attempt": 1})
         
         # s2 should still be at attempt 1
-        hint_s2 = next_hint(s2, "help", store)
+        hint_s2 = next_hint(s2, "help", store, now_ms=_later())
         assert hint_s2["attempt"] == 1
 
     def test_pause_policy_string_int_conversion(self, store):

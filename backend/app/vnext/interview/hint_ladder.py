@@ -13,6 +13,7 @@ Attempt levels:
 """
 from __future__ import annotations
 
+import time
 from typing import List, Optional
 
 from .store import STORE
@@ -62,6 +63,18 @@ _HINTS = {
 _ESCALATING_INTENTS = frozenset({"help", "repeat"})
 
 
+# Progress events: evidence the candidate actually TRIED after a hint —
+# editing code, running it, or giving a substantive answer.
+_PROGRESS_TYPES = {"code.edited", "code.run"}
+
+
+def _is_progress_event(e: dict) -> bool:
+    t = e.get("type")
+    if t in _PROGRESS_TYPES:
+        return True
+    return t == "conversation.intent.detected" and e.get("intent") == "answer"
+
+
 def _count_prior_hints(session_id: str, intent: str, store=None) -> int:
     """Count how many hints have been emitted for this intent in this session."""
     if store is None:
@@ -76,17 +89,81 @@ def _count_prior_hints(session_id: str, intent: str, store=None) -> int:
     return count
 
 
+def _progress_credits(events: list[dict], intent: str) -> int:
+    """Wood's contingency signal: how many hints for `intent` were followed by
+    real progress (a code edit, a run, a substantive answer) before the next
+    hint request. Each earns a credit that steps the help level BACK — the
+    contingent-tutoring rule: succeed after help → less help next time; fail
+    after help → more."""
+    credits = 0
+    hint_open = False  # a hint was given; watching for progress before the next one
+    for e in events:
+        if e.get("type") == "interviewer.utterance" and e.get("hint_for") == intent:
+            hint_open = True
+        elif hint_open and _is_progress_event(e):
+            credits += 1
+            hint_open = False
+    return credits
+
+
 def _count_wrong_attempts(session_id: str, intent: str, store=None) -> int:
-    """Count consecutive wrong attempts for this intent (how many times the candidate got it wrong).
+    """Effective help level for `intent`, recomputed from the ledger.
 
-    This is an approximation based on how many times we emitted a hint for this intent.
-    A more sophisticated implementation might track explicit 'wrong' events, but for now
-    each hint implies a prior wrong attempt. Attempt numbering starts at 1.
+    Base: each prior hint implies a wrong attempt (numbering starts at 1).
+    For the escalating HELP ladder, Wood's contingent-tutoring rule adjusts it:
+    every hint that was followed by real progress earns a credit that steps
+    the level back — a candidate who applies hint 1 and comes back stays
+    around level 1 instead of being marched to the reveal.
     """
-    return _count_prior_hints(session_id, intent, store) + 1
+    if store is None:
+        store = STORE
+    prior = _count_prior_hints(session_id, intent, store)
+    if intent == "help" and prior:
+        prior -= min(_progress_credits(store.get_events(session_id, 0), intent), prior)
+    return prior + 1
 
 
-def next_hint(session_id: str, intent: str, store=None, ladder: Optional[List[str]] = None) -> Optional[dict]:
+# ── hint-gaming throttle (Baker/MATHia): refuse rapid-fire escalation ────────
+
+# A hint can't have been read+tried faster than this. ~15 chars/sec reading
+# plus a floor for actually attempting something.
+_MIN_READ_TRY_MS = 8_000
+_READ_MS_PER_CHAR = 66  # ≈15 chars/second
+
+
+def _throttle_check(session_id: str, intent: str, store, now_ms: Optional[int]) -> Optional[dict]:
+    """If the previous help hint was requested faster than it could be read and
+    tried, refuse escalation: ask for a restatement instead. The throttle line
+    carries NO hint_for, so it never advances the attempt counter."""
+    if intent != "help":
+        return None
+    events = store.get_events(session_id, 0)
+    last_hint = next(
+        (e for e in reversed(events)
+         if e.get("type") == "interviewer.utterance" and e.get("hint_for") == intent),
+        None,
+    )
+    if last_hint is None or not isinstance(last_hint.get("ts"), (int, float)):
+        return None
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    needed = max(_MIN_READ_TRY_MS, len(str(last_hint.get("text", ""))) * _READ_MS_PER_CHAR)
+    if now - last_hint["ts"] >= needed:
+        return None
+    return {
+        "text": ("Before I take you further — apply the last hint first. "
+                 "Restate it in your own words and try it in the code box."),
+        "hint_throttled": intent,
+        "exhausted": False,
+    }
+
+
+def next_hint(
+    session_id: str,
+    intent: str,
+    store=None,
+    ladder: Optional[List[str]] = None,
+    now_ms: Optional[int] = None,
+) -> Optional[dict]:
     """Return payload for the next hint for `intent`, or None if none.
 
     The returned dict is suitable as the `payload` for an `interviewer.utterance`
@@ -94,9 +171,12 @@ def next_hint(session_id: str, intent: str, store=None, ladder: Optional[List[st
 
     ``ladder`` overrides the built-in ladder for `intent` (used by
     ``hint_provider`` for per-session overrides) so escalation/exhaustion logic
-    lives in ONE place instead of being re-implemented per caller.
+    lives in ONE place instead of being re-implemented per caller. ``now_ms``
+    is injectable for deterministic throttle tests.
 
-    Attempt-based escalation:
+    Attempt-based escalation (help level is CONTINGENT — see
+    ``_count_wrong_attempts``; rapid-fire requests are throttled — see
+    ``_throttle_check``):
     - Attempt 1: nudge (make them think)
     - Attempt 2: hint (point them toward the fix)
     - Attempt 3+: reveal (state the key idea)
@@ -107,6 +187,10 @@ def next_hint(session_id: str, intent: str, store=None, ladder: Optional[List[st
     ladders: List[str] = ladder if ladder is not None else _HINTS.get(intent, [])
     if not ladders:
         return None
+
+    throttled = _throttle_check(session_id, intent, store, now_ms)
+    if throttled is not None:
+        return throttled
 
     attempt = _count_wrong_attempts(session_id, intent, store)
 

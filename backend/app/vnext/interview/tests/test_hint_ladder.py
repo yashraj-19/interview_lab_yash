@@ -3,6 +3,13 @@ from fastapi.testclient import TestClient
 
 from app.vnext.interview.router import router
 from app.vnext.interview.hint_ladder import next_hint
+
+# Escalation calls simulate prior hints minted 'just now'; a future clock
+# steps past the anti-gaming read-time throttle (which is tested separately).
+def _later():
+    import time
+    return int(time.time() * 1000) + 60_000
+
 from app.vnext.interview.store import STORE
 
 
@@ -31,18 +38,18 @@ def test_next_hint_sequence():
     STORE.append_event(sid, "interviewer", "interviewer.utterance", {"text": h1["text"], "hint_for": "help", "hint_step": 1})
 
     # second hint
-    h2 = next_hint(sid, "help")
+    h2 = next_hint(sid, "help", now_ms=_later())
     assert h2 is not None
     assert h2["hint_step"] == 2
 
     # exhaust ladder
     STORE.append_event(sid, "interviewer", "interviewer.utterance", {"text": h2["text"], "hint_for": "help", "hint_step": 2})
-    h3 = next_hint(sid, "help")
+    h3 = next_hint(sid, "help", now_ms=_later())
     assert h3 is not None
     assert h3["hint_step"] == 3
 
     # after exhausting, next returns exhausted True
     STORE.append_event(sid, "interviewer", "interviewer.utterance", {"text": h3["text"], "hint_for": "help", "hint_step": 3})
-    h4 = next_hint(sid, "help")
+    h4 = next_hint(sid, "help", now_ms=_later())
     assert h4 is not None
     assert h4.get("exhausted") is True
