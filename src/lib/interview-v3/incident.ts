@@ -80,9 +80,10 @@ export const PROBLEM_DEFAULTS = {
     "and testing discipline under interview conditions.",
 };
 
-/** Normalize a query-param track value to a known track shape (or undefined). */
+/** Normalize a query-param track value to a known track shape (or undefined).
+ * "auto" lets the backend pick a problem from the intake's role + seniority. */
 export function normalizeTrack(value: string | null | undefined): string | undefined {
-  if (value === INCIDENT_TRACK) return INCIDENT_TRACK;
+  if (value === INCIDENT_TRACK || value === "auto") return value;
   if (value && PROBLEM_TRACK_RX.test(value)) return value;
   return undefined;
 }

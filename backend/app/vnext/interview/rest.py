@@ -11,7 +11,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from .scenario import get_scenario, list_problem_scenarios
+from .scenario import get_scenario, list_problem_scenarios, scenario_for_role
 from .llm import generate_jd, generate_rubric_llm
 from .models import Intake
 from .phase_controller import PhaseController, TransitionContext
@@ -98,8 +98,13 @@ class CreateSessionBody(BaseModel):
     # llm-mode session skips OpenRouter and uses deterministic scripted content
     # over the SAME real WS/store/controller path. Ignored otherwise.
     fake_llm: bool = False
-    # Optional lab-only interview track (e.g. "incident-demo"). None = default flow.
+    # Optional lab-only interview track (e.g. "incident-demo", "problem:two_sum").
+    # "auto" resolves a problem scenario from the intake's role + seniority.
+    # None = default flow.
     track: str | None = None
+    # Optional interviewer persona ("collaborative" | "rigorous"). None derives
+    # from seniority (senior/staff -> rigorous).
+    persona: str | None = None
     # Opt-in conversational onboarding: when true the WS opens with a greeting
     # and holds advance.request until the audio/readiness checks complete.
     # Default false — most flows (incident auto-start, tests) skip the gate.
@@ -147,7 +152,13 @@ async def create_session(body: CreateSessionBody) -> dict:
     rec = STORE.get_session(session_id)
     rec["mode"] = body.mode
     rec["fake_llm"] = bool(body.fake_llm) and fake_llm_allowed()
-    rec["track"] = body.track
+    track = body.track
+    if track == "auto":
+        # Role/seniority-aware problem selection (stable per role+seniority).
+        spec = scenario_for_role(intake.get("role", ""), intake.get("seniority", "mid"))
+        track = spec.id if spec is not None else None
+    rec["track"] = track
+    rec["persona"] = body.persona
     rec["onboarding"] = bool(body.onboarding)
     STORE.put_session(session_id, rec)
     ledger = STORE.get_ledger(session_id)
@@ -179,9 +190,9 @@ async def bind_rubric(session_id: str, body: RubricBody) -> dict:
     spec = get_scenario(rec.get("track"))
     if spec is not None and spec.rubric_factory is not None:
         # Deterministic, scenario-shaped rubric (incident: code/concurrency/test/
-        # ops/tradeoff; problems: correctness/approach/complexity/testing/comm) —
-        # same whether the LLM is live or faked.
-        rubric = spec.rubric_factory(session_id)
+        # ops/tradeoff; problems: correctness/approach/complexity/testing/comm,
+        # reweighted by the intake's role track) — same live or faked.
+        rubric = spec.rubric_factory(session_id, intake)
     elif rec.get("mode") == "llm":
         # LLM rubric with deterministic scripted fallback baked in.
         rubric = await generate_rubric_llm(session_id, intake, fake_llm=bool(rec.get("fake_llm")))

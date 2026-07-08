@@ -376,6 +376,7 @@ async def _generate_turn(ws_session_id: str, signal: str, phase: str, turn_id: s
             transcript_events=STORE.get_events(ws_session_id, 0),
             fake_llm=bool(rec.get("fake_llm")),
             track=track,
+            persona=rec.get("persona"),
         )
     except asyncio.CancelledError:
         return None  # barged-in mid-generation — emit nothing

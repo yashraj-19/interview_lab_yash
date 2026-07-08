@@ -21,6 +21,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+from ..roles import pick_persona
 from ..scenario import get_scenario
 from ..phase_controller import ADVANCE_SIGNALS
 from ._parse import extract_json
@@ -210,6 +211,7 @@ def _build_messages(
     last_answer: str = "",
     prev_opening: str = "",
     track: str | None = None,
+    persona: str | None = None,
 ) -> list[dict]:
     crit = ", ".join(c.get("name", "") for c in (rubric.get("criteria") or []))
     languages = ", ".join(intake.get("languages", []) or []) or "(unspecified)"
@@ -254,6 +256,9 @@ def _build_messages(
         "NOT suggest advancing toward wrap_up while code or design evidence is "
         "still missing."
     )
+    # Persona tone contract — explicit persona wins, else derived from
+    # seniority. Prepended to EVERY turn so tone stays consistent all session.
+    system += "\n" + pick_persona(persona, intake.get("seniority"))["prompt_addition"]
     spec = get_scenario(track)
     if spec is not None:
         system += (
@@ -305,6 +310,7 @@ async def generate_interviewer_turn(
     transcript_events: list[dict],
     fake_llm: bool = False,
     track: str | None = None,
+    persona: str | None = None,
 ) -> Optional[dict]:
     """Return ``{"text": str, "suggestedAdvance": str | None}`` or None.
 
@@ -332,6 +338,7 @@ async def generate_interviewer_turn(
                 last_answer=last_answer,
                 prev_opening=prev_opening,
                 track=track,
+                persona=persona,
             ),
             role="interviewer",
             temperature=0.5,

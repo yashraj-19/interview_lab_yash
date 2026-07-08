@@ -83,6 +83,17 @@ export default function InterviewV3LabHome() {
             </Link>
           ))}
         </div>
+        <Link
+          href={scenarioIntakeUrl("auto")}
+          className="inline-flex items-center rounded-md border border-[var(--muted)] bg-[var(--muted)]/20 px-4 py-2 text-sm font-semibold transition-colors hover:bg-[var(--muted)]/40"
+        >
+          Match a problem to my role →
+        </Link>
+        <p className="text-xs text-[var(--muted-foreground)]">
+          Role-matched: an SDE intern gets an easier problem scored on reasoning
+          and communication; a senior ML engineer gets a harder one scored on
+          approach and complexity.
+        </p>
       </section>
 
       {/* Secondary options — kept available, visually de-emphasized. */}

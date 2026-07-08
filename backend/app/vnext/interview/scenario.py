@@ -41,6 +41,7 @@ from .incident import (
     incident_rubric,
 )
 from .problem_spec import PROBLEM_CATALOG, ProblemSpec
+from .roles import difficulty_band, role_weights
 from .seed import normalize_weights
 
 # Track ids for problem scenarios: "problem:two_sum" etc.
@@ -61,8 +62,9 @@ class ScenarioSpec:
     default_line: str = "Keep going — walk me through your next step."
     # Per-phase guidance injected into the LLM system prompt.
     phase_guidance: Mapping[str, str] = field(default_factory=dict)
-    # session_id -> rubric dict (deterministic).
-    rubric_factory: Optional[Callable[[str], dict]] = None
+    # (session_id, intake) -> rubric dict (deterministic; intake lets the
+    # role track reweight competencies).
+    rubric_factory: Optional[Callable[..., dict]] = None
     # Per-scenario never-reveal help ladder (nudge → hint → reveal).
     hint_ladder: Sequence[str] = ()
     # Answer terms reveal_guard blocks before hint attempt 3.
@@ -184,8 +186,8 @@ def _problem_guidance(p: ProblemSpec) -> dict[str, str]:
     }
 
 
-def _problem_rubric_factory(p: ProblemSpec) -> Callable[[str], dict]:
-    def factory(session_id: str) -> dict:
+def _problem_rubric_factory(p: ProblemSpec) -> Callable[..., dict]:
+    def factory(session_id: str, intake: Optional[dict] = None) -> dict:
         criteria = [
             {
                 "id": "correctness",
@@ -228,6 +230,13 @@ def _problem_rubric_factory(p: ProblemSpec) -> Callable[[str], dict]:
                 "phaseHints": ["intro", "coding"],
             },
         ]
+        # Role track reweights competencies deterministically: an SDE intern is
+        # scored more on communication, an ML engineer more on approach and
+        # complexity. The scorecard pins weights to the rubric server-side, so
+        # this is enforced scoring, not prompt advice.
+        rw = role_weights((intake or {}).get("role"))
+        for c in criteria:
+            c["weight"] = rw.get(c["id"], c["weight"])
         weights = normalize_weights([c["weight"] for c in criteria])
         for c, w in zip(criteria, weights):
             c["weight"] = w
@@ -352,7 +361,7 @@ _INCIDENT_SCENARIO = ScenarioSpec(
     lines_for_signal=INCIDENT_LINES,
     default_line="Keep going — tighten the fix.",
     phase_guidance=INCIDENT_PHASE_GUIDANCE,
-    rubric_factory=incident_rubric,
+    rubric_factory=lambda session_id, intake=None: incident_rubric(session_id),
     hint_ladder=(),           # incident keeps the generic help ladder
     reveal_terms=(),          # its fix terms are public in the task prompt
     code_is_unsafe=incident_code_is_unsafe,
@@ -381,13 +390,22 @@ def list_problem_scenarios() -> list[ScenarioSpec]:
 
 
 def scenario_for_role(role: str, seniority: str) -> Optional[ScenarioSpec]:
-    """Role/seniority-aware pick among problem scenarios (difficulty ladder)."""
-    order = {"junior": ("easy",), "mid": ("easy", "medium"), "senior": ("medium", "hard")}
-    wanted = order.get((seniority or "mid").lower(), ("easy", "medium"))
-    pool = [s for s in list_problem_scenarios() if s.problem and s.problem.difficulty in wanted]
+    """Role/seniority-aware pick among problem scenarios.
+
+    The role track's difficulty band filters the pool; the pick inside the
+    band is a stable hash of role+seniority so different roles land on
+    different problems deterministically (same inputs → same problem)."""
+    wanted = difficulty_band(role, seniority)
+    pool = sorted(
+        (s for s in list_problem_scenarios() if s.problem and s.problem.difficulty in wanted),
+        key=lambda s: s.id,
+    )
     if not pool:
-        pool = list_problem_scenarios()
-    return pool[0] if pool else None
+        pool = sorted(list_problem_scenarios(), key=lambda s: s.id)
+    if not pool:
+        return None
+    idx = sum(ord(ch) for ch in f"{role}|{seniority}".lower()) % len(pool)
+    return pool[idx]
 
 
 __all__ = [
