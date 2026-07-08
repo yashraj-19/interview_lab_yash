@@ -100,6 +100,10 @@ class CreateSessionBody(BaseModel):
     fake_llm: bool = False
     # Optional lab-only interview track (e.g. "incident-demo"). None = default flow.
     track: str | None = None
+    # Opt-in conversational onboarding: when true the WS opens with a greeting
+    # and holds advance.request until the audio/readiness checks complete.
+    # Default false — most flows (incident auto-start, tests) skip the gate.
+    onboarding: bool = False
 
 
 class RubricBody(BaseModel):
@@ -144,6 +148,7 @@ async def create_session(body: CreateSessionBody) -> dict:
     rec["mode"] = body.mode
     rec["fake_llm"] = bool(body.fake_llm) and fake_llm_allowed()
     rec["track"] = body.track
+    rec["onboarding"] = bool(body.onboarding)
     STORE.put_session(session_id, rec)
     ledger = STORE.get_ledger(session_id)
 

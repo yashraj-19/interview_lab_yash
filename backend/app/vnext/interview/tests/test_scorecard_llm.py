@@ -255,8 +255,10 @@ def test_llm_malformed_scorecard_falls_back_to_scripted(client, monkeypatch):
         ws.send_json(_hello(sid))
         ws.receive_json(); ws.receive_json()
         # In llm mode candidate/code events aren't auto-emitted; inject them so
-        # the scripted fallback's ref ids exist in the ledger.
-        ws.send_json({"type": "candidate.text", "text": "hi"}); ws.receive_json()
+        # the scripted fallback's ref ids exist in the ledger. Use a plain
+        # answer-classified text ("hi" is meta_audio and would emit extra
+        # intent/hint frames that misalign the fixed-count reads below).
+        ws.send_json({"type": "candidate.text", "text": "I'd use a hash map."}); ws.receive_json()
         ws.send_json({"type": "scorecard.request"})
         # Scripted fallback emits 4 criteria + completed.
         evs = [ws.receive_json() for _ in range(5)]

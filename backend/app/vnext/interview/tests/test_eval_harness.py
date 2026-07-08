@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from app.vnext.interview.intent import RuleBasedIntentClassifier
-from app.vnext.interview.hint_ladder import next_hint, _count_wrong_attempts
+from app.vnext.interview.hint_ladder import next_hint, _count_wrong_attempts, _HINTS
 from app.vnext.interview.pause_policy import get_pause_for, register_pause_provider, unregister_pause_provider
 from app.vnext.interview.store import InMemoryInterviewStore
 
@@ -47,19 +47,37 @@ class TestIntentClassification:
         assert classifier.classify("\tok\t") == "backchannel"
 
     def test_cut_in_explicit_interrupts(self, classifier):
-        """Cut-in: explicit interrupt words detected."""
-        cut_in_words = ["wait", "stop", "hold", "hang", "sorry", "actually", "no", "hey", "pause", "excuse"]
+        """Cut-in: explicit interrupt words detected when nothing more specific matches."""
+        # Bare "hold" and "no" match no other intent regex, so they classify cut_in.
+        cut_in_words = ["wait", "stop", "hold", "hang", "sorry", "actually", "no", "pause", "excuse"]
         for word in cut_in_words:
             result = classifier.classify(word)
             assert result == "cut_in", f"'{word}' should be cut_in, got {result}"
 
+        # "hey" is the one word that genuinely re-routes: meta_audio is checked
+        # before cut_in and its pattern includes hey/hi/hello.
+        assert classifier.classify("hey") == "meta_audio"
+
     def test_cut_in_mid_utterance_not_triggered(self, classifier):
-        """Cut-in: only if word opens the utterance (not mid-sentence)."""
-        # "wait" at start -> cut-in
-        assert classifier.classify("wait, let me think") == "cut_in"
-        # "wait" in middle -> might be "thinking" or "answer" depending on other patterns
+        """Cut-in classification yields to more specific intents; deterministic."""
+        # "wait, let me think" -> thinking (specific intents are checked before
+        # cut_in). The URGENCY property (cancel scheduled speech) is preserved
+        # separately by is_cut_in — see test_cut_in_urgency_preserved.
+        assert classifier.classify("wait, let me think") == "thinking"
+        # "wait" in the middle never triggers cut-in (prefix-anchored regex).
         result = classifier.classify("let me wait a moment")
         assert result in ("thinking", "answer"), f"Mid-utterance 'wait' should not force cut_in, got {result}"
+
+    def test_cut_in_urgency_preserved(self, classifier):
+        """is_cut_in stays True for utterance-initial interrupt words even when
+        the final intent routes elsewhere — this is what the WS loop uses to
+        cancel scheduled interviewer speech, so the reorder must not lose it."""
+        assert classifier.is_cut_in("wait, let me think") is True
+        assert classifier.is_cut_in("wait, I need help") is True
+        assert classifier.is_cut_in("stop, that's not what I meant") is True
+        # Non-initial interrupt words carry no urgency.
+        assert classifier.is_cut_in("let me wait a moment") is False
+        assert classifier.is_cut_in("I need help") is False
 
     def test_help_intent(self, classifier):
         """Help: candidate stuck."""
@@ -98,9 +116,13 @@ class TestIntentClassification:
         assert classifier.classify(None) == "answer"
 
     def test_cut_in_precedence(self, classifier):
-        """Cut-in: takes precedence over other intents (urgent)."""
-        # "wait, I need help" -> cut_in (not help)
-        assert classifier.classify("wait, I need help") == "cut_in"
+        """Mixed utterances route to the specific intent; bare interrupts stay cut_in."""
+        # "wait, I need help" -> help ladder (the content wins); urgency is
+        # handled by is_cut_in independently (test_cut_in_urgency_preserved).
+        assert classifier.classify("wait, I need help") == "help"
+
+        # "wait" alone -> cut_in
+        assert classifier.classify("wait") == "cut_in"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -116,7 +138,7 @@ class TestNeverRevealHintEscalation:
         session_id = store.create_session({"role": "SDE", "seniority": "mid"})
         ledger = store.get_ledger(session_id)
 
-        hint = next_hint(session_id, "help")
+        hint = next_hint(session_id, "help", store)
         assert hint is not None
         assert hint["attempt"] == 1
         assert hint["exhausted"] is False
@@ -132,7 +154,7 @@ class TestNeverRevealHintEscalation:
         store.append_event(session_id, "interviewer", "interviewer.utterance", 
                           {"hint_for": "help", "hint_step": 1, "attempt": 1})
         
-        hint = next_hint(session_id, "help")
+        hint = next_hint(session_id, "help", store)
         assert hint is not None
         assert hint["attempt"] == 2
         assert hint["exhausted"] is False
@@ -146,7 +168,7 @@ class TestNeverRevealHintEscalation:
         store.append_event(session_id, "interviewer", "interviewer.utterance", 
                           {"hint_for": "help", "hint_step": 2, "attempt": 2})
         
-        hint = next_hint(session_id, "help")
+        hint = next_hint(session_id, "help", store)
         assert hint is not None
         assert hint["attempt"] == 3
         assert hint["exhausted"] is True  # final reveal
@@ -156,28 +178,102 @@ class TestNeverRevealHintEscalation:
         session_id = store.create_session({"role": "SDE", "seniority": "mid"})
         
         # Emit hint for "help"
-        hint_help_1 = next_hint(session_id, "help")
+        hint_help_1 = next_hint(session_id, "help", store)
         assert hint_help_1["attempt"] == 1
         
         # Hint for "repeat" should still be at attempt 1 (independent)
-        hint_repeat_1 = next_hint(session_id, "repeat")
+        hint_repeat_1 = next_hint(session_id, "repeat", store)
         assert hint_repeat_1["attempt"] == 1
         
         # Emit another hint for "help"
         store.append_event(session_id, "interviewer", "interviewer.utterance", 
                           {"hint_for": "help", "hint_step": 1, "attempt": 1})
-        hint_help_2 = next_hint(session_id, "help")
+        hint_help_2 = next_hint(session_id, "help", store)
         assert hint_help_2["attempt"] == 2
         
         # "repeat" still at 1
-        hint_repeat_still_1 = next_hint(session_id, "repeat")
+        hint_repeat_still_1 = next_hint(session_id, "repeat", store)
         assert hint_repeat_still_1["attempt"] == 1
 
     def test_unknown_intent_returns_none(self, store):
         """Unknown intent: no hint."""
         session_id = store.create_session({"role": "SDE", "seniority": "mid"})
-        hint = next_hint(session_id, "unknown_intent_xyz")
+        hint = next_hint(session_id, "unknown_intent_xyz", store)
         assert hint is None
+
+    def test_ack_intents_clamp_past_last_rung(self, store):
+        """cut_in/thinking/meta_audio are acknowledgments — once the ladder is
+        exhausted they CLAMP to the last rung (keep reassuring), never switch to
+        the 'still stuck, move on' prompt that would wrongly accuse the candidate."""
+        session_id = store.create_session({"role": "SDE"})
+        for intent in ("cut_in", "thinking", "meta_audio"):
+            rungs = _HINTS[intent]
+            for _ in range(len(rungs)):  # exhaust the ladder
+                store.append_event(session_id, "interviewer", "interviewer.utterance", {"hint_for": intent})
+            hint = next_hint(session_id, intent, store)  # attempt = len+1
+            assert hint["text"] == rungs[-1], f"{intent} should clamp to its final rung"
+            assert "move on" not in hint["text"].lower()
+            assert "still stuck" not in hint["text"].lower()
+            assert hint["exhausted"] is True
+
+    def test_escalating_intents_offer_move_on(self, store):
+        """help/repeat DO escalate to a move-on prompt once genuinely exhausted."""
+        for intent in ("help", "repeat"):
+            session_id = store.create_session({"role": "SDE"})
+            for _ in range(len(_HINTS[intent])):
+                store.append_event(session_id, "interviewer", "interviewer.utterance", {"hint_for": intent})
+            hint = next_hint(session_id, intent, store)
+            assert "move on" in hint["text"].lower()
+            assert hint["exhausted"] is True
+
+    def test_next_hint_ladder_override_escalates(self, store):
+        """A custom ladder passed to next_hint escalates via the same counter."""
+        session_id = store.create_session({"role": "SDE"})
+        h1 = next_hint(session_id, "help", store, ladder=["A", "B"])
+        assert (h1["text"], h1["hint_step"], h1["exhausted"]) == ("A", 1, False)
+        store.append_event(session_id, "interviewer", "interviewer.utterance", {"hint_for": "help"})
+        h2 = next_hint(session_id, "help", store, ladder=["A", "B"])
+        assert (h2["text"], h2["hint_step"], h2["exhausted"]) == ("B", 2, True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION-OVERRIDE HINTS + ONBOARDING READINESS (Stage 0 regressions)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestSessionOverrideAndReadiness:
+    """Guards for bugs fixed in Stage 0: session-hint overrides must escalate,
+    and onboarding readiness must be whole-word and negation-aware."""
+
+    def test_session_hint_override_escalates_not_stuck_on_rung_one(self):
+        from app.vnext.interview.store import STORE
+        from app.vnext.interview.hint_provider import get_hint_for
+        sid = STORE.create_session({"role": "SDE"})
+        rec = STORE.get_session(sid)
+        rec["session_hints"] = {"help": ["first custom hint", "second custom hint"]}
+        STORE.put_session(sid, rec)
+
+        h1 = get_hint_for(sid, "help")
+        assert (h1["text"], h1["hint_step"]) == ("first custom hint", 1)
+        STORE.append_event(sid, "interviewer", "interviewer.utterance", {"hint_for": "help"})
+        h2 = get_hint_for(sid, "help")
+        assert (h2["text"], h2["hint_step"]) == ("second custom hint", 2)
+        assert h2["exhausted"] is True
+
+    def test_readiness_whole_word_and_negation(self):
+        from app.vnext.interview.ws import _READY_RX, _NOT_READY_RX
+
+        def is_ready(t: str) -> bool:
+            return bool(_READY_RX.search(t)) and not _NOT_READY_RX.search(t)
+
+        assert is_ready("I'm ready")
+        assert is_ready("okay I'm ready")
+        assert is_ready("the environment is ready")   # benign 'nt' word, not a negation
+        assert not is_ready("I already tried that")    # 'already' has no \\bready\\b
+        assert not is_ready("I'm not ready")
+        assert not is_ready("I don't think I'm ready")
+        assert not is_ready("not sure I'm ready")
+        assert not is_ready("never going to be ready")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -191,8 +287,8 @@ class TestPausePolicyDynamic:
     def test_pause_default_zero(self, store):
         """Pause: defaults to 0ms (immediate) if no policy set."""
         session_id = store.create_session({"role": "SDE", "seniority": "mid"})
-        assert get_pause_for(session_id, "help") == 0
-        assert get_pause_for(session_id, "repeat") == 0
+        assert get_pause_for(session_id, "help", store) == 0
+        assert get_pause_for(session_id, "repeat", store) == 0
 
     def test_pause_session_override(self, store):
         """Pause: per-session REST override applied."""
@@ -201,9 +297,9 @@ class TestPausePolicyDynamic:
         rec["pause_policies"] = {"help": 500, "repeat": 300}
         store.put_session(session_id, rec)
         
-        assert get_pause_for(session_id, "help") == 500
-        assert get_pause_for(session_id, "repeat") == 300
-        assert get_pause_for(session_id, "thinking") == 0  # not set
+        assert get_pause_for(session_id, "help", store) == 500
+        assert get_pause_for(session_id, "repeat", store) == 300
+        assert get_pause_for(session_id, "thinking", store) == 0  # not set
 
     def test_pause_provider_priority(self, store):
         """Pause: pluggable provider takes priority over session override."""
@@ -220,7 +316,7 @@ class TestPausePolicyDynamic:
         
         register_pause_provider(custom_provider)
         try:
-            assert get_pause_for(session_id, "help") == 1000  # provider wins
+            assert get_pause_for(session_id, "help", store) == 1000  # provider wins
         finally:
             unregister_pause_provider()
 
@@ -237,7 +333,7 @@ class TestPausePolicyDynamic:
         
         register_pause_provider(broken_provider)
         try:
-            assert get_pause_for(session_id, "help") == 500  # fallback to session
+            assert get_pause_for(session_id, "help", store) == 500  # fallback to session
         finally:
             unregister_pause_provider()
 
@@ -249,8 +345,8 @@ class TestPausePolicyDynamic:
         store.put_session(session_id, rec)
         
         # Invalid values treated as 0
-        assert get_pause_for(session_id, "help") == 0
-        assert get_pause_for(session_id, "repeat") == 0
+        assert get_pause_for(session_id, "help", store) == 0
+        assert get_pause_for(session_id, "repeat", store) == 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -324,7 +420,7 @@ class TestProductionRobustness:
                           {"hint_for": "help", "hint_step": 1, "attempt": 1})
         
         # s2 should still be at attempt 1
-        hint_s2 = next_hint(s2, "help")
+        hint_s2 = next_hint(s2, "help", store)
         assert hint_s2["attempt"] == 1
 
     def test_pause_policy_string_int_conversion(self, store):
@@ -334,7 +430,7 @@ class TestProductionRobustness:
         rec["pause_policies"] = {"help": "500"}  # string, not int
         store.put_session(session_id, rec)
         
-        assert get_pause_for(session_id, "help") == 500
+        assert get_pause_for(session_id, "help", store) == 500
 
     def test_intent_case_insensitive(self, classifier):
         """Intent: matching is case-insensitive."""

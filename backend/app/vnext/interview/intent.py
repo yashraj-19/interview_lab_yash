@@ -40,6 +40,20 @@ class IntentClassifier:
                 pass
         return self._fallback.classify(text)
 
+    def is_cut_in(self, text: str) -> bool:
+        """Deterministic cut-in check for urgency/cancellation decisions.
+
+        Always rule-based — timing decisions never consult the (possibly slow
+        or nondeterministic) provider, mirroring the Voice_Assist rule that no
+        LLM sits in a timing path. This lets "wait, I'm stuck" route to the
+        'help' ladder while STILL cancelling scheduled interviewer speech.
+        """
+        return self._fallback.is_cut_in(text)
+
+    def is_backchannel(self, text: str) -> bool:
+        """Deterministic backchannel check (same rationale as is_cut_in)."""
+        return self._fallback.is_backchannel(text)
+
 
 class RuleBasedIntentClassifier:
     """Lightweight rule-based fallback. Keep patterns minimal and maintainable.
@@ -79,9 +93,7 @@ class RuleBasedIntentClassifier:
         # Backchannel: don't emit a handler hint for pure fillers.
         if self.is_backchannel(t):
             return "backchannel"
-        # Cut-in: urgent interrupt signal.
-        if self.is_cut_in(t):
-            return "cut_in"
+        # Check specific intents BEFORE cut-in (more specific first).
         if self._repeat_rx.search(t):
             return "repeat"
         if self._help_rx.search(t):
@@ -90,6 +102,9 @@ class RuleBasedIntentClassifier:
             return "thinking"
         if self._meta_audio_rx.search(t):
             return "meta_audio"
+        # Cut-in: urgent interrupt signal (checked last, after specific intents).
+        if self.is_cut_in(t):
+            return "cut_in"
         return "answer"
 
 

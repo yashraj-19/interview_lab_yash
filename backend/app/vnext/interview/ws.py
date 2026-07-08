@@ -17,6 +17,8 @@ Every emitted event is a flat ledger envelope assigned a server seq.
 from __future__ import annotations
 
 import asyncio
+import re
+
 from .intent import get_classifier
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -48,7 +50,6 @@ from .seed import (
 )
 from .store import STORE
 from .session_init import SessionInitManager
-from .hint_ladder import next_hint
 from .hint_provider import get_hint_for
 from .pause_policy import get_pause_for
 
@@ -77,22 +78,29 @@ def _emit(session_id: str, actor: str, type_: str, payload: dict) -> dict:
 
 _CLASSIFIER = get_classifier()
 
+# Onboarding readiness must be a whole word — bare substring matching marked a
+# candidate ready when they said "I ALREADY tried that". A negation within a few
+# words before "ready" ("I don't think I'm ready", "not at all ready") cancels
+# the match. Contractions are enumerated (not \w*n't) so benign words ending in
+# "nt" — environment, assignment, component — don't read as a negation.
+_READY_RX = re.compile(r"\bready\b", re.IGNORECASE)
+_NOT_READY_RX = re.compile(
+    r"\b(?:not|never|cannot|don'?t|doesn'?t|didn'?t|won'?t|can'?t|couldn'?t|"
+    r"wouldn'?t|shouldn'?t|isn'?t|aren'?t|ain'?t|wasn'?t)\b(?:\s+\S+){0,4}?\s+ready\b",
+    re.IGNORECASE,
+)
 
-def _intent_reply_text(intent: str) -> str | None:
-    replies = {
-        "repeat": "Let me repeat the goal more clearly so you can focus on the next concrete step.",
-        "help": "Let's narrow this to the next step: identify the failing condition and write the first guard or check in the code box.",
-        "thinking": "Take your time. I’ll wait while you work through it.",
-        "meta_audio": "I can hear you. Please continue and I’ll stay with you.",
-    }
-    return replies.get(intent)
 
-
-def _handle_candidate_text(session_id: str, text: str, force_immediate: bool = False) -> list[dict]:
+def _handle_candidate_text(
+    session_id: str, text: str, force_immediate: bool = False, intent: str | None = None
+) -> list[dict]:
     """Emit the candidate utterance plus a focused director event for recognized intents.
-    
+
     Backchannels ("yeah", "okay", etc.) are logged but don't emit hints.
     Cut-in words ("wait", "stop", etc.) force immediate cancellation + hint.
+    ``intent`` lets the WS loop pass its already-computed classification so the
+    utterance is classified exactly once (a nondeterministic provider could
+    otherwise disagree between the urgency decision and the hint decision).
     """
     seq_hint = (STORE.get_ledger(session_id).last_seq) + 1
     out: list[dict] = [
@@ -103,8 +111,9 @@ def _handle_candidate_text(session_id: str, text: str, force_immediate: bool = F
             {"lineId": f"cand-{seq_hint}", "text": str(text)},
         )
     ]
-    intent = _CLASSIFIER.classify(text, session_id)
-    
+    if intent is None:
+        intent = _CLASSIFIER.classify(text, session_id)
+
     # Backchannel: no hint needed, just log.
     if intent == "backchannel":
         out.append(
@@ -134,13 +143,21 @@ def _handle_candidate_text(session_id: str, text: str, force_immediate: bool = F
     # Resolve hint via the pluggable provider → session override → fallback.
     hint_payload = get_hint_for(session_id, intent)
     if hint_payload is not None:
+        # One whitelisted utterance shape used by BOTH the immediate and the
+        # scheduled path, so the ledger-audit contract (hint_for + hint_step +
+        # attempt on every hint) holds regardless of pause policy. lineId is
+        # added per-emit (the scheduler mints its own at fire time).
+        hint_fields = {"text": hint_payload.get("text", "")}
+        for key in ("hint_for", "hint_step", "attempt"):
+            if hint_payload.get(key) is not None:
+                hint_fields[key] = hint_payload[key]
+        hint_fields["exhausted"] = hint_payload.get("exhausted", False)
+
         # If a recent candidate barge-in cancelled an interviewer, the UX expects
         # an immediate corrective hint — bypass pause policies when forced.
         if force_immediate:
-            payload = {"lineId": f"dir-{seq_hint}", "text": hint_payload.get("text", ""),
-                       "hint_for": hint_payload.get("hint_for"), "hint_step": hint_payload.get("hint_step"),
-                       "exhausted": hint_payload.get("exhausted", False)}
-            out.append(_emit(session_id, "interviewer", "interviewer.utterance", payload))
+            out.append(_emit(session_id, "interviewer", "interviewer.utterance",
+                             {"lineId": f"dir-{seq_hint}", **hint_fields}))
             return out
 
         pause_ms = 0
@@ -153,12 +170,10 @@ def _handle_candidate_text(session_id: str, text: str, force_immediate: bool = F
             # schedule interviewer utterance later; emit a system.pause.scheduled event
             out.append(_emit(session_id, "system", "system.pause.scheduled", {"intent": intent, "delay_ms": pause_ms}))
             # return a scheduled marker that the WS loop will pick up and schedule
-            out.append({"scheduled_interviewer": {"payload": hint_payload, "delay_ms": pause_ms}})
+            out.append({"scheduled_interviewer": {"payload": hint_fields, "delay_ms": pause_ms}})
         else:
-            payload = {"lineId": f"dir-{seq_hint}", "text": hint_payload.get("text", ""),
-                       "hint_for": hint_payload.get("hint_for"), "hint_step": hint_payload.get("hint_step"),
-                       "exhausted": hint_payload.get("exhausted", False)}
-            out.append(_emit(session_id, "interviewer", "interviewer.utterance", payload))
+            out.append(_emit(session_id, "interviewer", "interviewer.utterance",
+                             {"lineId": f"dir-{seq_hint}", **hint_fields}))
     return out
 
 
@@ -410,10 +425,32 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
         }
     )
 
-    # Initialize session-init manager (do not auto-emit greeting here to
-    # preserve existing scripted event ordering; callers may register greeting
-    # later when appropriate).
+    # Onboarding is OPT-IN per session (rec["onboarding"], set at create).
+    # Sessions that didn't opt in skip the readiness gate entirely — the
+    # previous unconditional gate deadlocked every interview because
+    # register_greeting had no production caller, so greeting_done could
+    # never become true over the wire.
     session_init = SessionInitManager(session_id)
+    onboarding_enabled = bool(rec.get("onboarding"))
+    # Cached once onboarding completes so the hot path stops re-reading the
+    # store's is_complete() on every subsequent message (completion is monotonic).
+    onboarding_done = not onboarding_enabled
+    if onboarding_enabled and not (rec.get(SessionInitManager.KEY) or {}).get("greeting_done"):
+        greeting_text = (
+            "Hi, I'm Maya. Quick check before we begin — say something so I can "
+            "confirm your audio, and tell me when you're ready."
+        )
+        # Registering the greeting is what lets is_complete() ever become true.
+        await websocket.send_json(session_init.register_greeting(greeting_text))
+        await websocket.send_json(
+            _emit(
+                session_id,
+                "interviewer",
+                "interviewer.utterance",
+                {"lineId": f"onboard-greet-{STORE.get_ledger(session_id).last_seq + 1}",
+                 "text": greeting_text},
+            )
+        )
 
     # ── drive the session via inbound signals ──
     # A send lock serializes the main loop's sends with the background turn-
@@ -469,23 +506,28 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
             if mtype == "advance.request":
                 signal = str(msg.get("signal", ""))
                 sess = STORE.get_session(session_id)
-                # Block advances until onboarding complete.
-                try:
-                    if not session_init.is_complete():
-                        # Remind candidate to finish onboarding; do not advance.
-                        await send(
-                            _emit(
-                                session_id,
-                                "interviewer",
-                                "interviewer.utterance",
-                                {"lineId": f"onboard-{STORE.get_ledger(session_id).last_seq + 1}",
-                                 "text": "Please complete the quick audio and readiness checks before we begin."},
+                # Readiness gate applies ONLY to opted-in sessions that haven't
+                # finished onboarding; every other flow advances freely. Once
+                # complete we cache it so this store read never recurs.
+                if not onboarding_done:
+                    try:
+                        if session_init.is_complete():
+                            onboarding_done = True
+                        else:
+                            # Remind candidate to finish onboarding; do not advance.
+                            await send(
+                                _emit(
+                                    session_id,
+                                    "interviewer",
+                                    "interviewer.utterance",
+                                    {"lineId": f"onboard-{STORE.get_ledger(session_id).last_seq + 1}",
+                                     "text": "Please complete the quick audio and readiness checks before we begin."},
+                                )
                             )
-                        )
-                        continue
-                except Exception:
-                    # keep going if session_init check fails
-                    pass
+                            continue
+                    except Exception:
+                        # keep going if session_init check fails
+                        onboarding_done = True
                 if sess and sess.get("mode") == "llm":
                     prelude, turn_id, phase = _advance_llm_prelude(session_id, signal)
                     for ev in prelude:
@@ -527,17 +569,48 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
 
             elif mtype == "candidate.text":
                 text_str = str(msg.get("text", ""))
-                # Inspect intent first to determine if urgent interrupt.
+
+                # ── opt-in onboarding: setup step, not a barge-in or an answer ──
+                # While onboarding is incomplete an utterance only drives the
+                # audio/readiness checks; it deliberately skips the interrupt +
+                # hint machinery so an audio-problem report ("no sound") can't
+                # trigger a cut-in acknowledgment or a spurious barge_in.detected.
+                if not onboarding_done:
+                    low = (text_str or "").lower()
+                    seq_hint = STORE.get_ledger(session_id).last_seq + 1
+                    await send(_emit(session_id, "candidate", "candidate.utterance",
+                                     {"lineId": f"cand-{seq_hint}", "text": text_str}))
+                    if "muted" in low or "no sound" in low or "can't hear" in low or "cannot hear" in low:
+                        await send(session_init.mark_audio_problem(text_str))
+                    else:
+                        # Receiving ANY candidate speech proves the mic/STT work,
+                        # so onboarding no longer soft-locks when the candidate
+                        # never happens to say a "can you hear me" phrase.
+                        await send(session_init.mark_audio_ok())
+                        # Whole-word readiness only ("already" must not match);
+                        # a negated "…not ready" never confirms.
+                        if _READY_RX.search(low) and not _NOT_READY_RX.search(low):
+                            await send(session_init.mark_ready())
+                    if session_init.is_complete():
+                        onboarding_done = True
+                    continue
+
+                # Classify ONCE; the same intent is passed into
+                # _handle_candidate_text so urgency and hint decisions can
+                # never diverge (a provider could otherwise disagree between
+                # two calls on the same utterance).
                 try:
                     intent = _CLASSIFIER.classify(text_str, session_id)
                 except Exception:
                     intent = "answer"
 
-                # Determine if this is an urgent interrupt (cut-in word like "wait", "stop").
-                # Only cancel scheduled interviewer tasks on urgent interrupts, not on every text.
-                is_urgent_interrupt = intent == "cut_in"
+                # Urgency is decided by the DETERMINISTIC cut-in check, NOT the
+                # (possibly provider-supplied) final intent, so timing never
+                # depends on a nondeterministic classifier: "wait, I'm stuck"
+                # routes to the 'help' ladder but still cancels scheduled speech.
+                is_urgent_interrupt = _CLASSIFIER.is_cut_in(text_str)
                 cancelled_any = False
-                
+
                 if is_urgent_interrupt:
                     # Cut-in: aggressively cancel all scheduled interviewer utterances.
                     for task in list(scheduled_interviewer_tasks):
@@ -545,35 +618,19 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
                         try:
                             task.cancel()
                             cancelled_any = True
-                            await send(_emit(session_id, "system", "system.pause.cancelled", 
-                                           {"intent": meta.get("payload", {}).get("hint_for"), 
+                            await send(_emit(session_id, "system", "system.pause.cancelled",
+                                           {"intent": meta.get("payload", {}).get("hint_for"),
                                             "delay_ms": meta.get("delay_ms"),
                                             "reason": "cut_in"}))
                         except Exception:
                             pass
                     scheduled_interviewer_tasks.clear()
                     # Emit barge-in latency marker (for monitoring).
-                    await send(_emit(session_id, "system", "barge_in.detected", 
+                    await send(_emit(session_id, "system", "barge_in.detected",
                                    {"intent": intent, "text": text_str}))
 
-                # quick audio/problem heuristics
-                low = (text_str or "").lower()
-                if "muted" in low or "no sound" in low or "can't hear" in low or "cannot hear" in low:
-                    ev = session_init.mark_audio_problem(text_str)
-                    await send(ev)
-                elif intent == "meta_audio":
-                    # candidate checking connectivity → mark audio ok
-                    ev = session_init.mark_audio_ok()
-                    await send(ev)
-
-                # explicit readiness phrases
-                ready_phrases = ("ready", "i'm ready", "im ready", "i am ready")
-                if any(p in low for p in ready_phrases):
-                    ev = session_init.mark_ready()
-                    await send(ev)
-
                 # Pass force_immediate flag if this was an urgent interrupt.
-                for ev in _handle_candidate_text(session_id, text_str, force_immediate=cancelled_any):
+                for ev in _handle_candidate_text(session_id, text_str, force_immediate=cancelled_any, intent=intent):
                     # scheduled interviewer markers are dicts with key 'scheduled_interviewer'
                     if isinstance(ev, dict) and ev.get("scheduled_interviewer"):
                         si = ev["scheduled_interviewer"]

@@ -24,7 +24,9 @@ def unregister_pause_provider() -> None:
     _provider = None
 
 
-def get_pause_for(session_id: str, intent: str) -> int:
+def get_pause_for(session_id: str, intent: str, store=None) -> int:
+    if store is None:
+        store = STORE
     # provider priority
     if _provider is not None:
         try:
@@ -34,7 +36,7 @@ def get_pause_for(session_id: str, intent: str) -> int:
         except Exception:
             pass
     # session override
-    rec = STORE.get_session(session_id) or {}
+    rec = store.get_session(session_id) or {}
     policies = rec.get("pause_policies") or {}
     val = policies.get(intent)
     try:

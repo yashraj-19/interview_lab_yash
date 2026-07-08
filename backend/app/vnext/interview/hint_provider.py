@@ -42,13 +42,14 @@ def get_hint_for(session_id: str, intent: str) -> Optional[dict]:
         except Exception:
             # provider must not crash the flow; fall through to session override
             pass
-    # session-level override
+    # session-level override — delegate to next_hint with the override ladder so
+    # escalation/exhaustion behaves identically to the built-in ladder (was: a
+    # re-implementation stuck on the final rung forever).
     rec = STORE.get_session(session_id) or {}
     session_hints = rec.get("session_hints") or {}
     ladder = session_hints.get(intent)
     if ladder:
-        # build a simple hint from ladder[0] (caller will handle step index)
-        return {"text": ladder[0], "hint_for": intent, "hint_step": 1, "exhausted": False}
+        return _fallback_next_hint(session_id, intent, ladder=list(ladder))
     # fallback
     return _fallback_next_hint(session_id, intent)
 
