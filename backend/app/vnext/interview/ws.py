@@ -52,6 +52,7 @@ from .store import STORE
 from .session_init import SessionInitManager
 from .hint_provider import get_hint_for
 from .pause_policy import get_pause_for
+from .reveal_guard import guard_interviewer_line
 
 router = APIRouter()
 
@@ -357,14 +358,23 @@ async def _generate_turn(ws_session_id: str, signal: str, phase: str, turn_id: s
     except asyncio.CancelledError:
         return None  # barged-in mid-generation — emit nothing
 
-    text = turn["text"] if turn else _scripted_interviewer_line(signal, track)
     seq_hint = (STORE.get_ledger(ws_session_id).last_seq) + 1
-    return _emit(
-        ws_session_id,
-        "interviewer",
-        "interviewer.utterance",
-        {"lineId": f"llm-{seq_hint}", "text": text, "turnId": turn_id},
-    )
+    payload: dict = {"lineId": f"llm-{seq_hint}", "turnId": turn_id}
+    if turn:
+        # Output-side persona guard — LLM text only. The prompt already forbids
+        # verdicts/praise, but nothing enforced it; one "That's exactly right!"
+        # leak breaks the never-confirm rule, so offending sentences are dropped
+        # (whole line -> rotating neutral probe if nothing survives). Scripted
+        # fallback lines are curated and stay exempt, as does the hint ladder
+        # (it is the designated pushback lane).
+        text, guard_reasons = guard_interviewer_line(turn["text"], seq=seq_hint)
+        if guard_reasons:
+            payload["guarded"] = True
+            payload["guard_reasons"] = guard_reasons
+    else:
+        text = _scripted_interviewer_line(signal, track)
+    payload["text"] = text
+    return _emit(ws_session_id, "interviewer", "interviewer.utterance", payload)
 
 
 async def _build_scorecard(session_id: str) -> tuple[list[dict], dict]:
