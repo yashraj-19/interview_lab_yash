@@ -165,7 +165,7 @@ def _handle_candidate_text(
         # attempt on every hint) holds regardless of pause policy. lineId is
         # added per-emit (the scheduler mints its own at fire time).
         hint_fields = {"text": hint_payload.get("text", "")}
-        for key in ("hint_for", "hint_step", "attempt"):
+        for key in ("hint_for", "hint_step", "attempt", "hint_throttled"):
             if hint_payload.get(key) is not None:
                 hint_fields[key] = hint_payload[key]
         hint_fields["exhausted"] = hint_payload.get("exhausted", False)

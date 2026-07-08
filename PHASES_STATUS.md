@@ -1,74 +1,18 @@
-# Handoff & Phase Status — SDE AI Interview
+# Build Status — Dynamic Interview Engine
 
-This file summarizes the planned phases, what I've implemented in the repository so far, and the remaining work to reach the full SDE scope you defined.
+All six stages are implemented, tested, and committed. Suite status:
+**195 backend tests / 105 frontend tests, all green; zero hangs.**
 
-## Timeline (rough)
-- Baseline mapped: ✅ done
-- Phase 1 (intent layer): ~2–3 days — ✅ done
-- Phase 2 (pause/timing model): ~5 days — not started
-- Phase 3 (handlers + never-reveal hint ladder): ~7 days — in progress (prototype rule-based handlers present)
-- Phase 4 (eval harness): ~8 days — not started
-- Phase 5 (5–6 SDE problems via problem-spec engine): ~10 days — not started
+| Stage | Commit | What shipped | Verified by |
+|---|---|---|---|
+| 0 · Stabilize | `dcdd90e` | Un-deadlocked the onboarding gate (now opt-in), deterministic cut-in urgency, classify-once, neutral hint wording, unified override escalation, restored weakened tests | full suite un-hung; 15-scenario live WS probe |
+| 1 · Turn engine | `e191456` | Semantic turn-end (3-arm rule), backchannel-immune barge-in (works all session), latency-masking fillers, anti-double supersede gate | 15 turn-taking unit tests + WS race test |
+| 2 · Never-reveal | `4e8553e` | Output guard on every LLM line: verdicts, praise, and scenario answer terms neutralized in code (not prompts) | 13 tests incl. real-WS leak neutralization |
+| 3 · ScenarioSpec | `c88e1d9` | The interview is dynamic: incident + all 6 catalog problems behind one behavioral contract; real sandboxed code execution; backend vends scenario content; launcher/intake/room generalized | 21 tests: registry contract, detectors, runner (incl. timeout), full WS problem flow |
+| 4 · Roles | `f1d0056` | Role tracks reweight rubrics (enforced server-side), personas with anti-sycophancy tone contracts, `track:"auto"` role-matched problem selection | 8 tests |
+| 5 · Adaptivity | `d8afe61` | Wood's contingent hint level, hint-gaming throttle, neutral silence ladder, 12s LLM stall recovery, conversation-quality metrics panel | 10 backend + 6 frontend tests |
 
-Estimated total: ~2 weeks of focused work (with iteration and voice testing).
-
----
-
-## What I implemented (done)
-- Added a pluggable intent classifier (default rule-based fallback): [backend/app/vnext/interview/intent.py](backend/app/vnext/interview/intent.py)
-- Replaced the hard-coded regex classifier in the WebSocket flow with the pluggable `IntentClassifier`: modified [backend/app/vnext/interview/ws.py](backend/app/vnext/interview/ws.py)
-- Created a `SessionInitManager` to persist onboarding flags and emit ledger events: [backend/app/vnext/interview/session_init.py](backend/app/vnext/interview/session_init.py)
-- Wired `SessionInitManager` into the WS flow (blocks `advance.request` until onboarding complete, handles candidate audio/readiness messages): [backend/app/vnext/interview/ws.py](backend/app/vnext/interview/ws.py)
-- Added unit tests covering session init lifecycle: [backend/app/vnext/interview/tests/test_session_init.py](backend/app/vnext/interview/tests/test_session_init.py)
-- Ensured existing conversation director tests still pass and ran targeted tests: [backend/app/vnext/interview/tests/test_conversation_director.py](backend/app/vnext/interview/tests/test_conversation_director.py)
-- Committed and pushed these changes to `origin/main`.
-
----
-
-## What remains (short-term priorities)
-1. Add unit tests for the `IntentClassifier` (pluggable provider behavior and fallback).  
-2. Finalize and extend Phase 1 handlers: implement full never-reveal "hint ladder" for HELP/REPEAT/META_AUDIO/THINKING with configurable policies.  
-3. Design & implement Phase 2 (pause/timing model): service endpoint, per-intent pause policies, and integration into the live flow (non-blocking, auditable).  
-4. Create Phase 4 eval harness: scripted edge-case runner that asserts intent detection, pause behaviors, and never-reveal policy (CI-able).  
-5. Author docs: `SESSION_INIT.md`, architecture notes for the Conversational Director, and developer runbook for voice testing and Deepgram integration.  
-6. Run the full test suite and CI; iterate until green.  
-7. Add 5–6 SDE problems into the problem-spec engine and validate end-to-end with a real human (voice & editor).
-
----
-
-## Quick next steps I can take now
-- Add unit tests for `IntentClassifier` and push.  
-- Implement the never-reveal hint ladder for Phase 3 (server-side handlers + tests).  
-- Start Phase 2 design doc and a stub endpoint to accept pause policies.  
-
-If you want me to proceed immediately, tell me which of the above to start first (I recommend: `IntentClassifier` tests → Phase 3 handlers → Phase 2 design).
-
----
-
-## Useful commands
-Run targeted tests I added:
-
-```bash
-cd backend
-.\venv\Scripts\python.exe -m pytest -q app/vnext/interview/tests/test_session_init.py app/vnext/interview/tests/test_conversation_director.py
-```
-
-Run the full backend test suite:
-
-```bash
-cd backend
-.\venv\Scripts\python.exe -m pytest -q
-```
-
----
-
-## Files touched in this round
-- [backend/app/vnext/interview/intent.py](backend/app/vnext/interview/intent.py)
-- [backend/app/vnext/interview/session_init.py](backend/app/vnext/interview/session_init.py)
-- [backend/app/vnext/interview/ws.py](backend/app/vnext/interview/ws.py)
-- [backend/app/vnext/interview/tests/test_session_init.py](backend/app/vnext/interview/tests/test_session_init.py)
-
----
-
-Prepared by: development agent (work in this workspace).  
-If you'd like, I can add this file into a PR with a longer `SESSION_INIT.md` design doc, or continue by implementing `IntentClassifier` unit tests and Phase 3 handlers now.
+Remaining / known limitations (deliberate, documented in ARCHITECTURE.md):
+in-memory store (no restart survival), browser-speech STT (Chrome +
+headphones), dev-sandbox runner (not a hardened jail), same-browser review
+links, typed event union lags the live event set.

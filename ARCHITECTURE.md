@@ -1,441 +1,201 @@
-# Architecture: Dynamic Real-Time Interview System
+# Architecture — Dynamic AI Interview Engine
 
-## System Overview
+Maya conducts a live technical interview over voice: she presents a scenario,
+listens with real turn-taking, reviews the candidate's code as they type,
+gives never-reveal hints, runs their code against real test cases, and
+produces an evidence-cited scorecard. One generic engine conducts **seven
+scenarios** (the production-incident demo plus six SDE problems) across
+**three role tracks** — adding a scenario is data, not engine surgery.
 
-A **production-ready, fully dynamic** AI interview system that adapts in real-time to candidate behavior without hardcoded conversational logic. The system combines:
+Everything below is implemented and covered by the test suite
+(**195 backend / 105 frontend tests, all green**). Known limitations are
+listed honestly at the end.
 
-1. **Event-sourced ledger** for audit trail and reproducibility
-2. **Pluggable intent classification** for conversational understanding
-3. **Attempt-based hint escalation** (never-reveal policy, matching Voice_Assist judge)
-4. **Real-time pause/timing control** with non-blocking scheduling
-5. **Dynamic problem catalog** with 6 SDE problems
-6. **Barge-in & turn-taking** aligned with interview UX best practices
-
----
-
-## Core Architecture Layers
+## Layer map
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ Frontend (WebSocket Client)                                     │
-│ - Real-time bidirectional communication                         │
-│ - Sends candidate text, code, run requests                      │
-│ - Receives interviewer utterances, hints, pause signals         │
-└────────────────┬────────────────────────────────────────────────┘
-                 │ WebSocket (/vnext/interview/ws/{session_id})
-                 ↓
-┌─────────────────────────────────────────────────────────────────┐
-│ WebSocket Handler (ws.py)                                       │
-│ - Manages session lifecycle                                     │
-│ - Routes messages (candidate.text, candidate.code, etc.)        │
-│ - Orchestrates intent → hint → pause scheduling                 │
-│ - Cancels scheduled utterances on barge-in (cut-in words)      │
-└────────────────┬────────────────────────────────────────────────┘
-                 │
-      ┌──────────┼──────────┐
-      ↓          ↓          ↓
-┌──────────────┐ ┌───────────────────┐ ┌──────────────────────┐
-│ Intent       │ │ Hint Ladder       │ │ Pause Policy         │
-│ Classifier   │ │ (Attempt-Based)   │ │ (Pluggable Provider) │
-│ (intent.py)  │ │ (hint_ladder.py)  │ │ (pause_policy.py)    │
-├──────────────┤ ├───────────────────┤ ├──────────────────────┤
-│ - Backchannel│ │ - Attempt 1:      │ │ - Provider Priority  │
-│ - Cut-in     │ │   Nudge (no ans)  │ │ - Session Override   │
-│ - Help       │ │ - Attempt 2:      │ │ - REST Config        │
-│ - Repeat     │ │   Hint (hint)     │ │ - Fallback: 0ms      │
-│ - Thinking   │ │ - Attempt 3+:     │ │ - Non-blocking       │
-│ - Meta-audio │ │   Reveal (answer) │ │   scheduling         │
-│ - Answer     │ │ - Never-reveal    │ │                      │
-│              │ │   policy enforced │ │                      │
-└──────────────┘ └───────────────────┘ └──────────────────────┘
-      │                  │                       │
-      └──────────────────┼───────────────────────┘
-                         ↓
-            ┌─────────────────────────────┐
-            │ Session Store (store.py)    │
-            ├─────────────────────────────┤
-            │ - Session record            │
-            │ - Event ledger              │
-            │ - Pause policies            │
-            │ - Hint overrides            │
-            └─────────────────────────────┘
-                         ↓
-            ┌─────────────────────────────┐
-            │ REST API (rest.py)          │
-            ├─────────────────────────────┤
-            │ POST /sessions              │
-            │ GET /sessions/{id}          │
-            │ GET /sessions/{id}/ledger   │
-            │ PATCH /sessions/{id}/hints  │
-            │ PATCH /sessions/{id}/pause  │
-            │ POST /hints/provider/...    │
-            │ POST /pause/provider/...    │
-            └─────────────────────────────┘
+Frontend (Next.js)                     Backend (FastAPI, in-memory)
+──────────────────                     ─────────────────────────────
+InterviewRoom (voice room)             ws.py        WebSocket orchestrator
+  turn-taking.ts   semantic turn-end     scenario.py  ScenarioSpec registry
+                   + barge-in gate       runner.py    sandboxed code runner
+  useVoice.ts      STT/TTS + fillers     intent.py    intent classifier
+  live-adapter.ts  REST+WS adapter       hint_ladder  contingent never-reveal
+  metrics.ts       quality metrics       hint_provider/pause_policy  plugins
+ReviewWorkspace (evidence + metrics)     reveal_guard output persona guard
+                                         roles.py     role tracks + personas
+Shared foundation: seq-ordered event ledger (ledger.py), 12-phase
+PhaseController (parity-tested against state-machine.ts), llm/ (OpenRouter
+with deterministic fallback at every call site).
 ```
 
----
-
-## Event-Sourced Ledger
-
-Every decision is recorded as an immutable event in the session ledger. The ledger is the source of truth.
-
-### Key Event Types
-
-| Event Type | Purpose | Metadata |
-|-----------|---------|----------|
-| `candidate.utterance` | Candidate speech → text | `text`, `lineId` |
-| `conversation.intent.detected` | Intent classification result | `intent`, `text`, `is_backchannel?` |
-| `interviewer.utterance` | Interviewer response (hint or question) | `text`, `hint_for?`, `hint_step?`, `attempt?`, `exhausted?` |
-| `system.pause.scheduled` | Pause policy applied | `intent`, `delay_ms` |
-| `system.pause.cancelled` | Scheduled pause cancelled | `intent`, `delay_ms`, `reason` |
-| `system.pause.completed` | Scheduled pause fired, hint emitted | `intent`, `delay_ms` |
-| `barge_in.detected` | Cut-in word detected | `intent`, `text` |
-| `phase.changed` | Phase transition | `from`, `to`, `signal` |
-
-### Ledger Query Example
-
-```bash
-curl http://localhost:8000/vnext/interview/sessions/{session_id}/ledger?since=0
-```
-
-Result: array of events, each with `seq` (monotonic), `actor`, `type`, `payload`, `timestamp`.
-
----
-
-## Pluggable Providers
-
-All decision-making logic is pluggable without code changes:
-
-### Intent Classifier
-```python
-from app.vnext.interview.intent import IntentClassifier
-
-classifier = IntentClassifier()
-
-# Register custom provider (e.g., LLM-based)
-def my_intent_provider(text: str, session_id: str) -> str:
-    # Your logic here
-    return "help"  # or "repeat", "thinking", etc.
-
-classifier.register_provider(my_intent_provider)
-```
-
-**Provider Priority**: Custom provider → Rule-based fallback
-
-### Hint Provider
-```python
-from app.vnext.interview.hint_provider import register_hint_provider
-
-def my_hint_provider(session_id: str, intent: str) -> Optional[dict]:
-    return {
-        "text": "Custom hint for " + intent,
-        "hint_for": intent,
-        "hint_step": 1,
-        "exhausted": False,
-    }
-
-register_hint_provider(my_hint_provider)
-```
-
-**Provider Priority**: Custom provider → Session overrides (REST) → Hardcoded ladder
-
-### Pause Policy
-```python
-from app.vnext.interview.pause_policy import register_pause_provider
-
-def my_pause_policy(session_id: str, intent: str) -> int:
-    # Return pause duration in milliseconds
-    if intent == "help":
-        return 500  # 500ms before emitting hint
-    return 0
-
-register_pause_provider(my_pause_policy)
-```
-
-**Provider Priority**: Custom provider → Session overrides (REST) → Default (0ms)
-
----
-
-## Barge-In & Turn-Taking
-
-Matching Voice_Assist reference patterns for human-like interruption:
-
-### Backchannel Immunity
-- Pure filler sounds ("yeah", "okay", "hmm") don't trigger hints
-- Logged as `conversation.intent.detected` with `is_backchannel: true`
-- No `interviewer.utterance` emitted
-
-### Cut-In Detection
-- Explicit interrupt words ("wait", "stop", "sorry") force immediate response
-- **Aggressive cancellation**: all scheduled pauses are cancelled
-- **Immediate hint**: bypass pause policy, emit hint immediately
-- Emits `barge_in.detected` event for latency monitoring
-
-### Selective Scheduling Cancellation
-- Only cut-in words trigger aggressive cancellation (not every text)
-- Scheduled tasks tracked in WebSocket session
-- On cancellation: emit `system.pause.cancelled` with reason
-
----
-
-## Attempt-Based Hint Escalation
-
-Per Voice_Assist judge pattern, hints escalate based on attempt number:
-
-### Attempt 1: Nudge
-- Direct question (make them think)
-- No answer-bearing terms revealed
-- Example: "What data structure lets you look up items in O(1)?"
-
-### Attempt 2: Hint
-- Pointed guidance toward fix (still no answer)
-- Example: "Use a hash map. Iterate once, checking if target - num is in the map."
-
-### Attempt 3+: Reveal
-- State the key idea or algorithm directly
-- Example: "The function should use a two-pointer or hash-based approach."
-
-### Never-Reveal Guarantee
-- Auditable via ledger `attempt` field in `interviewer.utterance` events
-- If LLM provider tries to reveal on attempt 1/2, the attempt metadata prevents it
-- All hints mapped through ledger history for consistency
-
----
-
-## Problem-Spec Engine (Phase 5)
-
-### Structure
-Each problem has:
-- **Spec**: signature, constraints, examples, time/space complexity
-- **Test Cases**: input/output pairs with descriptions
-- **Hint Ladder**: 3 escalation levels per attempt-based system
-- **Difficulty**: easy, medium, hard
-- **Selection**: by role/seniority (junior → easy, mid → medium, senior → hard)
-
-### 6 Foundational Problems
-1. **Two Sum** (easy): Hash map, O(n) time
-2. **Valid Parentheses** (easy): Stack, O(n) time
-3. **Merge Sorted Arrays** (easy): Two pointers, O(n+m) time
-4. **Reverse Linked List** (medium): Pointer manipulation, O(n) time
-5. **Binary Search** (medium): Divide & conquer, O(log n) time
-6. **Longest Substring Without Repeating** (medium): Sliding window, O(n) time
-
-### Usage
-```python
-from app.vnext.interview.problem_spec import get_problem, get_problem_for_role
-
-# Get problem by ID
-spec = get_problem("two_sum")
-
-# Get hint for a problem
-hint = get_hint_for_problem("two_sum", attempt=2)
-
-# Suggest problem by role/seniority
-problem_id = get_problem_for_role("SDE", "mid")
-```
-
----
-
-## Session Initialization & Onboarding
-
-Via `SessionInitManager` (session_init.py):
-1. Candidate receives greeting
-2. Audio/connectivity check ("Can you hear me?")
-3. Readiness confirmation ("Ready to start?")
-4. `is_complete()` blocks `advance.request` until all checks pass
-
-### State Persistence
-- Session record holds `session_init` dict with flags:
-  - `greeting_sent`: bool
-  - `audio_ok`: bool
-  - `ready`: bool
-
-### API
-```python
-session_init = SessionInitManager(session_id)
-session_init.register_greeting()
-session_init.mark_audio_ok()
-session_init.mark_ready()
-session_init.is_complete()  # → bool
-```
-
----
-
-## WebSocket Protocol
-
-### Inbound Messages
-
-**Candidate Text** (trigger intent classification):
-```json
-{"type": "candidate.text", "text": "I'm stuck, can I get a hint?"}
-```
-
-**Candidate Code**:
-```json
-{"type": "candidate.code", "code": "def foo(): pass"}
-```
-
-**Candidate Run**:
-```json
-{"type": "candidate.run", "code": "def foo(): return 1"}
-```
-
-**Barge-In** (interrupt scheduled utterance):
-```json
-{"type": "barge_in"}
-```
-
-**Advance Request** (move to next phase):
-```json
-{"type": "advance.request", "signal": "take_question"}
-```
-
-**Scorecard Request**:
-```json
-{"type": "scorecard.request"}
-```
-
-### Outbound Messages (Server → Client)
-
-**Resume Ready** (handshake):
-```json
-{"type": "resume_ready", "resumed": true, "from_seq": 0, "snapshot": {"phase": "rubric"}}
-```
-
-**Resume Events** (backfill):
-```json
-{"type": "resume_events", "from_seq": 0, "events": [...]}
-```
-
-**Event** (ledger entry):
-```json
-{
-  "type": "interviewer.utterance",
-  "seq": 42,
-  "actor": "interviewer",
-  "payload": {
-    "text": "Use a hash map.",
-    "hint_for": "help",
-    "hint_step": 2,
-    "attempt": 2,
-    "exhausted": false
-  }
-}
-```
-
----
-
-## Performance & Latency Budget
-
-Per hard rules in CLAUDE.md:
-
-| Metric | Target | Implementation |
-|--------|--------|-----------------|
-| User barge-in → TTS silence | < 200ms | Cut-in words force immediate cancellation + emit within 50ms |
-| Turn-end → first bot audio | < 800ms | Non-blocking scheduler, async LLM generation |
-| Judge verdict latency | < 1.5s | Provider call with 10s timeout, fail-safe CONTINUE |
-| Pause scheduling overhead | < 10ms | Sync calculation, asyncio scheduling |
-
-**No LLM calls on hot path**: All pause/intent/hint computations are either deterministic (rule-based) or cached (provider result).
-
----
-
-## Data Flow: Example Session
-
-1. **Client**: `{"type": "candidate.text", "text": "wait, let me think"}`
-2. **Server Intent**: Detects `cut_in` intent
-3. **Server Barge-In**: Cancels any scheduled interviewer utterance, emits `barge_in.detected`
-4. **Server Hint**: Gets hint for `cut_in` (if applicable), applies `force_immediate=True` (bypass pause)
-5. **Server Pause**: Check pause policy → 0ms (cut-in ignores pause)
-6. **Server Emit**: `interviewer.utterance` with hint text, `attempt` metadata
-7. **Client**: Receives hint immediately in ledger
-8. **Ledger**: Records full chain (intent, pause, barge-in, hint) with `seq` numbers
-
----
-
-## Extension Points
-
-### Add a New Intent
-Edit `intent.py` `RuleBasedIntentClassifier`:
-- Add regex pattern
-- Add case in `classify()` method
-- Register hints in `hint_ladder.py`
-
-### Add a New Problem
-Edit `problem_spec.py` `PROBLEM_CATALOG`:
-- Create `ProblemSpec` with full details
-- Add to dict with unique ID
-
-### Add a Custom Hint Provider
-```python
-from app.vnext.interview.hint_provider import register_hint_provider
-
-def my_provider(session_id, intent):
-    # Your logic
-    return {"text": "...", "hint_for": intent, "hint_step": 1}
-
-register_hint_provider(my_provider)
-```
-
-### Add a Custom Pause Policy
-```python
-from app.vnext.interview.pause_policy import register_pause_provider
-
-def my_policy(session_id, intent):
-    return 500 if intent == "help" else 0
-
-register_pause_provider(my_policy)
-```
-
----
-
-## Testing Strategy
-
-- **Unit Tests**: `test_eval_harness.py` (intent, hints, pause, ledger)
-- **Integration Tests**: `test_conversation_director.py` (WS flow)
-- **Problem Tests**: `test_problem_spec.py` (catalog, difficulty, complexity)
-- **Manual Tests**: PRODUCTION_DEPLOYMENT.md (barge-in, pause, never-reveal)
-
----
-
-## Deployment Topology
-
-```
-┌──────────────┐
-│ Frontend     │
-│ (Browser)    │
-└────────┬─────┘
-         │ HTTPS/WSS
-         ↓
-┌──────────────────┐
-│ Reverse Proxy    │
-│ (Nginx/HAProxy)  │
-└────────┬─────────┘
-         │
-         ↓
-┌──────────────────────────┐
-│ Backend (FastAPI)        │
-│ - uvicorn workers (3+)   │
-│ - WebSocket enabled      │
-│ - In-memory store (dev)  │
-│   or Supabase (prod)     │
-└──────────────────────────┘
-```
-
----
-
-## Production Checklist
-
-- [ ] All intent patterns tested
-- [ ] Pause provider error-safe (fallback to 0ms)
-- [ ] Scheduled tasks cleaned up on disconnect
-- [ ] Ledger entries complete & sequenced
-- [ ] WebSocket ping/pong healthy (20s interval)
-- [ ] Load test: 10+ concurrent sessions
-- [ ] Latency profiling: all operations < 100ms
-- [ ] Monitoring: barge-in events, pause accuracy, hint escalation distribution
-
----
-
-**Architecture Version**: 2.0 (Phase 1-5 Complete)  
-**Last Updated**: 2026-07-06
+## 1. Event-sourced ledger (the spine)
+
+Every fact is a flat event `{v, seq, ts, sessionId, actor, type, ...payload}`
+with a per-session monotonic `seq` (never ordered by timestamp) minted by a
+single writer (`ledger.py`). Consumers replay events instead of holding
+state: hint escalation, patch invariants, evidence resolution, and the
+conversation-quality metrics are all pure functions over the ledger. This is
+why reconnects are cheap (WS resume handshake + backfill) and why every
+interviewer decision is auditable after the fact.
+
+## 2. Phase control
+
+`phase_controller.py` owns a 12-phase linear machine
+(intake → rubric → ready → intro → resume_calibration → problem_framing →
+coding → debugging → optimization → wrap_up → scoring → review). The
+adapter/LLM emit *signals*; only the controller mints `phase.changed`. The
+same transition table exists in TypeScript and a parity test fails loudly on
+drift.
+
+## 3. ScenarioSpec — problems as behavior, not text
+
+`scenario.py` defines the behavioral contract a scenario must supply:
+
+| Hook | Incident demo | Problem scenarios (6) |
+|---|---|---|
+| seed code | buggy `charge_customer` | signature + constraints + example |
+| per-signal lines | incident narrative | generic coding-interview arc |
+| per-phase LLM guidance | race/atomicity probing | brute-force → optimize arc, never names the approach |
+| rubric | code/concurrency/test/ops/tradeoff | correctness/approach/complexity/testing/communication, **role-reweighted** |
+| wrong-code detector | read-then-insert race | for-in-for brute force; linear scan on sorted input |
+| code action | highlight + validated patch | highlight + probe, **never a patch** (a patch would reveal the answer) |
+| hints | generic help ladder | the problem's own never-reveal ladder |
+| reveal terms | none (fix is named in the task) | e.g. "hash map", "sliding window" — blocked until the final hint attempt |
+| test cases | — | executed for real by the runner |
+
+Detectors are deliberately conservative: they fire only on unambiguous
+anti-patterns and never act on foreign code. A `while`-inside-`for` sliding
+window is correctly *not* flagged — challenging an optimal solution would
+punish a correct answer.
+
+Scripted (no-LLM) mode plays each scenario's own deterministic lines, so a
+full interview works with **zero API keys** — live-LLM and offline paths stay
+behaviorally identical per scenario.
+
+## 4. Turn-taking (client, deterministic — no model in any timing path)
+
+Ported from the deployed Voice_Assist timing brain (`turn-taking.ts`):
+
+- **Semantic turn-end** replaces a fixed send timer: a trailing continuation
+  token ("so I think we could…", trailing comma, gerund) waits 4s; a
+  complete-sounding ending confirms in 700ms; neutral endings sit at 1.5s.
+  Every arm returns a finite delay, so a candidate who trails off can never
+  hang the interview.
+- **Barge-in gate**: backchannels ("mm-hm", "yeah") never cut Maya off;
+  utterance-initial cut-in words ("wait", "hold on", "stop") interrupt on a
+  single word; ≥3 substantive words or 700ms of sustained speech take the
+  floor. The token sets mirror `intent.py`, so client and server agree.
+- **Urgency is deterministic**: the server decides cancellation with
+  `is_cut_in(text)` independent of the (possibly LLM-supplied) intent, so
+  "wait, I'm stuck" routes to the help ladder *and* cancels scheduled speech.
+- Barge-in cancels the in-flight LLM turn server-side (`active_turns` +
+  `cancelled_turns`): a cancelled line never reaches the ledger.
+
+## 5. Dead air is architecturally impossible
+
+Four mechanisms cover every silence, in order:
+
+1. **Latency-masking fillers** — short lines in Maya's own voice, pre-fetched
+   once per session, played the instant a turn starts generating; the real
+   utterance supersedes them via a generation counter.
+2. **Stall recovery** — an LLM turn that produces nothing for 12s is
+   abandoned and completed with the deterministic scenario line
+   (`stallRecovered: true`).
+3. **Anti-double gate** — a pause-scheduled hint that another interviewer
+   line raced past is cancelled (`reason: "superseded"`), never double-spoken.
+4. **Silence ladder** — 25s of *joint* silence earns a neutral
+   "talk me through what you're thinking" (think-aloud research: a neutral
+   nudge, never a hint), 50s earns one check-in; resets on any candidate
+   activity and never fires during setup or generation.
+
+## 6. Never-reveal / never-confirm — enforced in code
+
+Three independent layers, because prompts alone leak:
+
+- **Prompt rules** (`interviewer_llm.py`): persona tone contracts, forbidden
+  praise/openers, per-scenario "never name the approach" appendix.
+- **Output guard** (`reveal_guard.py`): every LLM line is scanned before it
+  reaches the ledger — verdict statements ("that's exactly right/wrong",
+  "that's generally true"), generic praise, and scenario reveal terms
+  (before the final hint attempt) are dropped sentence-by-sentence; if
+  nothing survives, a rotating *neutral* probe replaces the line (neutral
+  because the guard cannot know right from wrong). Guarded events carry
+  `guarded: true` + reasons for audit. Curated scripted lines and the hint
+  ladder (the designated pushback lane) are exempt.
+- **Structural**: problem scenarios have no patch path at all — Maya can
+  highlight and probe but cannot write the solution.
+
+## 7. Adaptive hints (contingent tutoring)
+
+The help ladder (nudge → hint → reveal) escalates by ledger replay, with two
+research-grounded controls:
+
+- **Wood's contingency rule**: a hint followed by real progress (a code
+  edit, a run, a substantive answer) earns a credit that steps the level
+  back — succeed after help → less help next time; fail → more.
+- **Gaming throttle** (Baker/MATHia): a help request arriving faster than
+  the previous hint could be read (~15 chars/sec, 8s floor) is refused with
+  a restate-and-apply prompt that never advances the attempt counter.
+
+Acknowledgment intents (cut-in, thinking, audio checks) clamp at their final
+rung instead of escalating to a "still stuck?" prompt that would wrongly
+accuse the candidate. Per-session REST overrides and registered providers
+escalate through the same single code path.
+
+## 8. Real code execution
+
+`runner.py` executes the candidate's code against the scenario's test cases
+in a separate `python -I` process with a 3s hard timeout, run in a thread so
+barge-in handling never blocks. Honest results: per-case pass/fail with
+got/expected, order-insensitive comparison where the problem allows it,
+timeouts and exceptions reported as failures — never a fake green. Run
+results land in the ledger (`passed`/`total`) and feed the metrics panel and
+the contingent-hint progress signal.
+
+## 9. Roles and personas
+
+`roles.py`: role tracks (software_engineer / sde_intern / ml_engineer) carry
+competency weights that deterministically reshape the problem rubric — and
+the scorecard pins weights to the rubric server-side, so this is enforced
+scoring, not prompt advice. `track: "auto"` picks a problem from role +
+seniority (interns never get "hard"). Personas ("collaborative",
+"rigorous" bar-raiser) are tone contracts with hard anti-sycophancy rules
+prepended to every interviewer prompt.
+
+## 10. Evidence-cited scoring & conversation metrics
+
+The scorecard validates every LLM-proposed evidence reference against the
+ledger (seq must resolve, excerpts repaired, weights pinned, overall
+recomputed server-side) and falls back to a deterministic rubric-shaped
+scorecard on any failure. The review page adds a **conversation quality**
+panel computed purely from ledger timestamps: response-gap median/p90,
+turn-generation latency, barge-ins honored, pause discipline, hint depth and
+throttles, silence nudges, guarded lines, stall recoveries, run progression,
+talk balance.
+
+## Degradation ladder (what happens with no keys / no mic / no LLM)
+
+| Missing | Behavior |
+|---|---|
+| OpenRouter/OpenAI key | deterministic scenario lines; rubric/scorecard fall back to scripted; interview fully functional |
+| ElevenLabs key | browser speechSynthesis voice (audibly robotic but working) |
+| Microphone | "Type instead" box; same engine |
+| LLM stalls mid-turn | 12s stall recovery with the scenario line |
+
+## Honest limitations
+
+- **In-memory store**: sessions do not survive a backend restart. The
+  Supabase store mode is declared but its module is not implemented; it
+  falls back to memory. Run demos without `--reload`.
+- **STT is browser Web Speech** (effectively Chrome) with a token-overlap
+  echo heuristic — use headphones; there is no acoustic echo cancellation.
+- **The runner is a dev sandbox** (isolated process + timeout), not a
+  hardened jail; a hosted deployment should swap in a container behind the
+  same function signature.
+- **Review links** read the ledger from the browser that ran the interview
+  (localStorage); opening a review link elsewhere shows an empty workspace.
+- Onboarding (greeting → audio → ready gate) is **opt-in** per session and
+  off by default; the incident/problem demos auto-start without it.
+- `models.py`'s typed event union lags the full set of event types the WS
+  actually emits (the ledger itself is schemaless by design).
