@@ -33,15 +33,7 @@ from app.services.interview_resume import (
     select_backfill,
 )
 
-from .incident import (
-    INCIDENT_PATCH_UTTERANCE,
-    INCIDENT_TRACK,
-    incident_code_is_unsafe,
-    incident_line,
-    incident_patch,
-    incident_patch_is_safe,
-    incident_risky_range,
-)
+from .scenario import get_scenario
 from .llm import build_scorecard_llm, build_scripted_scorecard, generate_interviewer_turn
 from .phase_controller import PhaseController, TransitionContext
 from .seed import (
@@ -62,11 +54,12 @@ _SCRIPT_BY_SIGNAL = script_events_by_signal()
 def _scripted_interviewer_line(signal: str, track: str | None = None) -> str:
     """First scripted interviewer line for a signal's turn (llm fallback text).
 
-    For the incident track the fallback is the deterministic incident line so the
-    fake/no-LLM path stays in the incident narrative.
+    Scenario tracks (incident, problem:*) use their spec's deterministic
+    per-signal lines so the fake/no-LLM path stays in the scenario narrative.
     """
-    if track == INCIDENT_TRACK:
-        return incident_line(signal)
+    spec = get_scenario(track)
+    if spec is not None and spec.lines_for_signal:
+        return spec.lines_for_signal.get(signal, spec.default_line)
     for ev in _SCRIPT_BY_SIGNAL.get(signal, []):
         if ev.get("kind") == "interviewer.utterance":
             return ev["text"]
@@ -182,15 +175,18 @@ def _handle_candidate_text(
     return out
 
 
-def _incident_code_actions(session_id: str, code: str) -> list[dict]:
-    """After a candidate code edit on the incident track: if the buffer is still
-    racy, Maya selects/highlights the read-before-write path, explains it, and
-    proposes an idempotent patch. No-op off the incident track or when safe, and
-    never proposes a second patch while one is still open."""
+def _scenario_code_actions(session_id: str, code: str) -> list[dict]:
+    """After a candidate code edit on a scenario track: if the spec's detector
+    flags the buffer, Maya selects/highlights the risky lines, explains, and —
+    only when the spec allows patching (incident) — proposes a validated patch.
+    Problem scenarios highlight + probe but NEVER patch: writing the solution
+    for the candidate would reveal the answer. No-op off scenario tracks, when
+    the code is fine, or while a proposal is still open."""
     rec = STORE.get_session(session_id)
-    if not rec or rec.get("track") != INCIDENT_TRACK:
+    spec = get_scenario(rec.get("track")) if rec else None
+    if spec is None or spec.code_is_unsafe is None:
         return []
-    if not incident_code_is_unsafe(code):
+    if not spec.code_is_unsafe(code):
         return []
     events = STORE.get_events(session_id, 0)
     resolved = {
@@ -204,9 +200,19 @@ def _incident_code_actions(session_id: str, code: str) -> list[dict]:
     )
     if has_open:
         return []  # one open proposal at a time
+    # Highlight-only scenarios: don't re-flag the same shape over and over —
+    # one probe per distinct edit is Maya being sharp; three is nagging.
+    if spec.build_patch is None:
+        last_probe = next(
+            (e for e in reversed(events)
+             if e.get("type") == "interviewer.utterance" and e.get("codeProbe")),
+            None,
+        )
+        if last_probe is not None and last_probe.get("text") == spec.action_utterance:
+            return []
 
     out: list[dict] = []
-    start, end = incident_risky_range(code)
+    start, end = (spec.risky_range or (lambda c: (0, 0)))(code)
     out.append(
         _emit(session_id, "interviewer", "selection.set",
               {"selection": {"start": start, "end": end, "owner": "interviewer"}})
@@ -215,10 +221,12 @@ def _incident_code_actions(session_id: str, code: str) -> list[dict]:
     out.append(
         _emit(session_id, "interviewer", "interviewer.utterance",
               {"lineId": f"maya-{STORE.get_ledger(session_id).last_seq + 1}",
-               "text": INCIDENT_PATCH_UTTERANCE})
+               "text": spec.action_utterance, "codeProbe": True})
     )
-    patch = incident_patch(code)
-    if not incident_patch_is_safe(patch["after"], patch["before"]):
+    if spec.build_patch is None:
+        return out  # highlight + probe only (never-reveal scenarios)
+    patch = spec.build_patch(code)
+    if spec.patch_is_safe is not None and not spec.patch_is_safe(patch["after"], patch["before"]):
         return out  # explain + select only; never emit an unsafe patch
     patch_id = f"patch-{STORE.get_ledger(session_id).last_seq + 1}"
     out.append(
@@ -295,6 +303,20 @@ def _drive_advance(ws_session_id: str, signal: str) -> list[dict]:
     )
     rec["phase"] = controller.phase
     STORE.put_session(ws_session_id, rec)
+    # Scenario tracks play THEIR deterministic per-signal line, not the generic
+    # two-sum demo script — a scenario interview stays coherent with no LLM key.
+    spec = get_scenario(rec.get("track"))
+    if spec is not None and spec.lines_for_signal:
+        emitted.append(
+            _emit(
+                ws_session_id,
+                "interviewer",
+                "interviewer.utterance",
+                {"lineId": f"scn-{STORE.get_ledger(ws_session_id).last_seq + 1}",
+                 "text": spec.lines_for_signal.get(signal, spec.default_line)},
+            )
+        )
+        return emitted
     for ev in _SCRIPT_BY_SIGNAL.get(signal, []):
         actor, type_, payload = script_event_to_payload(ev)
         emitted.append(_emit(ws_session_id, actor, type_, payload))
@@ -366,8 +388,17 @@ async def _generate_turn(ws_session_id: str, signal: str, phase: str, turn_id: s
         # leak breaks the never-confirm rule, so offending sentences are dropped
         # (whole line -> rotating neutral probe if nothing survives). Scripted
         # fallback lines are curated and stay exempt, as does the hint ladder
-        # (it is the designated pushback lane).
-        text, guard_reasons = guard_interviewer_line(turn["text"], seq=seq_hint)
+        # (it is the designated pushback lane). Scenario answer terms are
+        # blocked until the help ladder's final attempt (never-reveal contract).
+        spec = get_scenario(track)
+        reveal_terms = tuple(spec.reveal_terms) if spec is not None else ()
+        attempt = 1
+        if reveal_terms:
+            from .hint_ladder import _count_wrong_attempts
+            attempt = _count_wrong_attempts(ws_session_id, "help")
+        text, guard_reasons = guard_interviewer_line(
+            turn["text"], seq=seq_hint, attempt=attempt, reveal_terms=reveal_terms
+        )
         if guard_reasons:
             payload["guarded"] = True
             payload["guard_reasons"] = guard_reasons
@@ -689,9 +720,10 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
                     {"editId": f"edit-{seq_hint}", "after": code, "by": "candidate"},
                 )
                 await send(ev)
-                # Incident track: Maya reviews the buffer and, if it's still racy,
-                # selects the risky lines and proposes an idempotent patch.
-                for action in _incident_code_actions(session_id, code):
+                # Scenario tracks: Maya reviews the buffer and, if the spec's
+                # detector flags it, selects the risky lines and (incident only)
+                # proposes a validated patch.
+                for action in _scenario_code_actions(session_id, code):
                     await send(action)
 
             elif mtype in ("code.patch.accept", "code.patch.reject"):
@@ -699,13 +731,26 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
                     await send(action)
 
             elif mtype == "candidate.run":
+                run_code = str(msg.get("code", ""))
                 seq_hint = (STORE.get_ledger(session_id).last_seq) + 1
-                ev = _emit(
-                    session_id,
-                    "candidate",
-                    "code.run",
-                    {"runId": f"run-{seq_hint}", "code": str(msg.get("code", "")), "stdout": "", "exitCode": 0},
-                )
+                run_payload: dict = {"runId": f"run-{seq_hint}", "code": run_code}
+                rec_run = STORE.get_session(session_id)
+                run_spec = get_scenario(rec_run.get("track")) if rec_run else None
+                if run_spec is not None and run_spec.problem is not None and run_spec.problem.runnable:
+                    # REAL execution against the scenario's test cases (sandboxed
+                    # subprocess, hard timeout) — run in a thread so a slow run
+                    # never blocks the event loop / barge-in handling.
+                    from .runner import run_candidate_code
+                    from .scenario import _fn_name
+                    result = await asyncio.to_thread(
+                        run_candidate_code, run_code, run_spec.problem,
+                        _fn_name(run_spec.problem.function_signature),
+                    )
+                    run_payload.update(result)
+                else:
+                    # No runnable scenario: honest stub (never fake a pass).
+                    run_payload.update({"stdout": "", "exitCode": 0})
+                ev = _emit(session_id, "candidate", "code.run", run_payload)
                 await send(ev)
 
             elif mtype == "scorecard.request":

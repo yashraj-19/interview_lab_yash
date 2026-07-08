@@ -21,7 +21,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from ..incident import INCIDENT_PHASE_GUIDANCE, INCIDENT_TASK_PROMPT, INCIDENT_TRACK
+from ..scenario import get_scenario
 from ..phase_controller import ADVANCE_SIGNALS
 from ._parse import extract_json
 from .client import LLMUnavailable, call_llm
@@ -254,15 +254,21 @@ def _build_messages(
         "NOT suggest advancing toward wrap_up while code or design evidence is "
         "still missing."
     )
-    if track == INCIDENT_TRACK:
+    spec = get_scenario(track)
+    if spec is not None:
         system += (
-            "\nTRACK incident-demo: the candidate is looking at a buggy "
-            "charge_customer() in the code box. " + INCIDENT_TASK_PROMPT + " Open "
-            "with the incident, drive the fix IN CODE, and defer ALL background "
-            "questions to the very end. One short probe per turn."
+            f"\nTRACK {spec.id}: {spec.task_prompt} Open with the task, drive the "
+            "work IN THE CODE BOX, and defer ALL background questions to the very "
+            "end. One short probe per turn."
         )
+        if spec.reveal_terms:
+            system += (
+                " HARD RULE: never name the target approach or say any of these "
+                f"terms yourself: {', '.join(spec.reveal_terms)} — make the "
+                "candidate arrive at it."
+            )
     guidance = (
-        INCIDENT_PHASE_GUIDANCE.get(phase) if track == INCIDENT_TRACK else None
+        spec.phase_guidance.get(phase) if spec is not None else None
     ) or PHASE_GUIDANCE.get(phase, "Probe for concrete technical depth relevant to this phase.")
     user = (
         f"Current phase: {phase}\n"

@@ -12,7 +12,7 @@ Currently includes 6 foundational problems; extend by adding to PROBLEM_CATALOG.
 from __future__ import annotations
 
 from typing import Any, Callable, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -36,6 +36,14 @@ class ProblemSpec:
     hints: list[str]  # escalating hints (nudge -> hint -> reveal)
     time_complexity: str  # e.g. "O(n)", "O(n log n)"
     space_complexity: str  # e.g. "O(1)", "O(n)"
+    # Answer terms the interviewer must NOT speak before the final hint attempt
+    # (enforced by reveal_guard). Multi-word phrases — matching is substring-based.
+    reveal_terms: list[str] = field(default_factory=list)
+    # True when the expected output is order-insensitive (e.g. two_sum indices
+    # "in any order") — the runner sorts both sides before comparing.
+    unordered_result: bool = False
+    # False when test cases aren't plain-JSON runnable (e.g. linked lists).
+    runnable: bool = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -80,6 +88,8 @@ PROBLEM_CATALOG: dict[str, ProblemSpec] = {
         ],
         time_complexity="O(n)",
         space_complexity="O(n)",
+        reveal_terms=["hash map", "hashmap", "a dictionary", "a dict"],
+        unordered_result=True,
     ),
 
     "valid_parentheses": ProblemSpec(
@@ -121,6 +131,7 @@ PROBLEM_CATALOG: dict[str, ProblemSpec] = {
         ],
         time_complexity="O(n)",
         space_complexity="O(n)",
+        reveal_terms=["use a stack", "last in, first out", "lifo"],
     ),
 
     "merge_sorted_arrays": ProblemSpec(
@@ -157,6 +168,7 @@ PROBLEM_CATALOG: dict[str, ProblemSpec] = {
         ],
         time_complexity="O(n + m)",
         space_complexity="O(n + m)",
+        reveal_terms=["two pointers", "two-pointer"],
     ),
 
     "reverse_linked_list": ProblemSpec(
@@ -193,6 +205,8 @@ PROBLEM_CATALOG: dict[str, ProblemSpec] = {
         ],
         time_complexity="O(n)",
         space_complexity="O(1)",
+        reveal_terms=["curr.next = prev", "prev pointer"],
+        runnable=False,
     ),
 
     "binary_search": ProblemSpec(
@@ -226,6 +240,7 @@ PROBLEM_CATALOG: dict[str, ProblemSpec] = {
         ],
         time_complexity="O(log n)",
         space_complexity="O(1)",
+        reveal_terms=["divide the search space", "left and right pointers", "(left + right) // 2"],
     ),
 
     "longest_substring_without_repeating": ProblemSpec(
@@ -262,6 +277,7 @@ PROBLEM_CATALOG: dict[str, ProblemSpec] = {
         ],
         time_complexity="O(n)",
         space_complexity="O(min(n, m))",  # m = charset size
+        reveal_terms=["sliding window"],
     ),
 }
 

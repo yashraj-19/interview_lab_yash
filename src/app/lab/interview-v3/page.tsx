@@ -1,5 +1,17 @@
 import Link from "next/link";
-import { INCIDENT_INTAKE_URL } from "@/lib/interview-v3/incident";
+import { INCIDENT_INTAKE_URL, scenarioIntakeUrl } from "@/lib/interview-v3/incident";
+
+/** SDE problem tracks served by the backend scenario registry. Listed here for
+ *  a zero-fetch server-rendered launcher; the ids mirror GET /vnext/interview/problems
+ *  (backend registry stays the source of truth for behavior). */
+const PROBLEM_TRACKS: { track: string; title: string; difficulty: string }[] = [
+  { track: "problem:two_sum", title: "Two Sum", difficulty: "easy" },
+  { track: "problem:valid_parentheses", title: "Valid Parentheses", difficulty: "easy" },
+  { track: "problem:merge_sorted_arrays", title: "Merge Sorted Arrays", difficulty: "easy" },
+  { track: "problem:reverse_linked_list", title: "Reverse Linked List", difficulty: "medium" },
+  { track: "problem:binary_search", title: "Binary Search", difficulty: "medium" },
+  { track: "problem:longest_substring_without_repeating", title: "Longest Substring Without Repeating", difficulty: "medium" },
+];
 
 /** Lab launcher for Interview vNext. The software-engineer incident demo is the
  *  primary path; other adapter modes remain as secondary options. No query-param
@@ -45,6 +57,32 @@ export default function InterviewV3LabHome() {
           Best tested in <strong>Chrome</strong> · allow the microphone when asked
           · try speaking over the interviewer to test barge-in.
         </p>
+      </section>
+
+      {/* Dynamic SDE problem interviews — one generic engine, any problem. */}
+      <section className="rounded-lg border border-[var(--muted)] p-6 space-y-4">
+        <div className="space-y-1">
+          <h2 className="text-lg font-semibold">SDE coding interviews</h2>
+          <p className="text-sm text-[var(--muted-foreground)]">
+            The same interviewer conducts any problem: voice, barge-in, live code
+            review with line highlights, real test-case runs, never-reveal hints,
+            and an evidence-cited scorecard.
+          </p>
+        </div>
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+          {PROBLEM_TRACKS.map((p) => (
+            <Link
+              key={p.track}
+              href={scenarioIntakeUrl(p.track)}
+              className="group flex items-center justify-between rounded-md border border-[var(--muted)] px-4 py-3 text-sm transition-colors hover:bg-[var(--muted)]/20"
+            >
+              <span className="font-medium">{p.title}</span>
+              <span className="text-xs uppercase tracking-wide text-[var(--muted-foreground)]">
+                {p.difficulty} →
+              </span>
+            </Link>
+          ))}
+        </div>
       </section>
 
       {/* Secondary options — kept available, visually de-emphasized. */}

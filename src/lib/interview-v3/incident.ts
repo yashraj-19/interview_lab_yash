@@ -59,7 +59,30 @@ export const INCIDENT_DEFAULTS = {
 /** The canonical human entry URL for the incident demo (no param knowledge needed). */
 export const INCIDENT_INTAKE_URL = "/lab/interview-v3/intake?adapter=live-llm&track=incident-demo";
 
-/** Normalize a query-param track value to a known track (or undefined). */
+/** Problem-scenario tracks are "problem:<id>" — validated shape-wise here; the
+ * backend registry is the source of truth for which ids actually exist. */
+const PROBLEM_TRACK_RX = /^problem:[a-z0-9_]+$/;
+
+/** Build the entry URL for any scenario track (incident or problem:*). */
+export function scenarioIntakeUrl(track: string): string {
+  return `/lab/interview-v3/intake?adapter=live-llm&track=${encodeURIComponent(track)}`;
+}
+
+/** Sensible intake defaults for problem tracks (SDE coding interview). */
+export const PROBLEM_DEFAULTS = {
+  role: "Software Engineer",
+  seniority: "mid" as const,
+  languages: "python",
+  durationMinutes: 25,
+  jobDescription:
+    "Software engineer role with a strong data-structures and algorithms bar: " +
+    "clean problem decomposition, correct implementations, complexity analysis, " +
+    "and testing discipline under interview conditions.",
+};
+
+/** Normalize a query-param track value to a known track shape (or undefined). */
 export function normalizeTrack(value: string | null | undefined): string | undefined {
-  return value === INCIDENT_TRACK ? INCIDENT_TRACK : undefined;
+  if (value === INCIDENT_TRACK) return INCIDENT_TRACK;
+  if (value && PROBLEM_TRACK_RX.test(value)) return value;
+  return undefined;
 }

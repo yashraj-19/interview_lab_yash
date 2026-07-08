@@ -11,7 +11,12 @@ import {
   type Rubric,
   type Seniority,
 } from "@/lib/interview-v3";
-import { normalizeTrack, INCIDENT_TRACK, INCIDENT_DEFAULTS } from "@/lib/interview-v3/incident";
+import {
+  normalizeTrack,
+  INCIDENT_TRACK,
+  INCIDENT_DEFAULTS,
+  PROBLEM_DEFAULTS,
+} from "@/lib/interview-v3/incident";
 import { RubricPreview } from "./RubricPreview";
 import { API_URL } from "@/lib/api-url";
 
@@ -30,18 +35,20 @@ export function IntakeForm() {
   // Lab-only interview track (e.g. incident-demo). Backend-driven, so live-llm only.
   const track = mode === "live-llm" ? normalizeTrack(searchParams.get("track")) : undefined;
   const isIncident = track === INCIDENT_TRACK;
-  // Incident demo auto-starts (zero setup). `?manual=1` keeps the setup form —
+  const isScenario = Boolean(track); // incident-demo or problem:* — zero-setup flow
+  // Scenario tracks auto-start (zero setup). `?manual=1` keeps the setup form —
   // used by the e2e suite to exercise the intake → room path deterministically.
-  const autostart = isIncident && searchParams.get("manual") !== "1";
+  const autostart = isScenario && searchParams.get("manual") !== "1";
 
-  // The incident demo pre-fills sensible defaults so a human never touches setup.
+  // Scenario tracks pre-fill sensible defaults so a human never touches setup.
+  const defaults = isIncident ? INCIDENT_DEFAULTS : PROBLEM_DEFAULTS;
   const [resumeText, setResumeText] = useState("");
   const [resumeFileName, setResumeFileName] = useState<string | undefined>();
-  const [jobDescription, setJobDescription] = useState(isIncident ? INCIDENT_DEFAULTS.jobDescription : "");
-  const [role, setRole] = useState(isIncident ? INCIDENT_DEFAULTS.role : "Software Engineer");
-  const [seniority, setSeniority] = useState<Seniority>(isIncident ? INCIDENT_DEFAULTS.seniority : "mid");
-  const [languages, setLanguages] = useState(isIncident ? INCIDENT_DEFAULTS.languages : "python, typescript");
-  const [durationMinutes, setDurationMinutes] = useState(isIncident ? INCIDENT_DEFAULTS.durationMinutes : 45);
+  const [jobDescription, setJobDescription] = useState(isScenario ? defaults.jobDescription : "");
+  const [role, setRole] = useState(isScenario ? defaults.role : "Software Engineer");
+  const [seniority, setSeniority] = useState<Seniority>(isScenario ? defaults.seniority : "mid");
+  const [languages, setLanguages] = useState(isScenario ? defaults.languages : "python, typescript");
+  const [durationMinutes, setDurationMinutes] = useState(isScenario ? defaults.durationMinutes : 45);
   const [rubric, setRubric] = useState<Rubric | null>(null);
   const [intake, setIntake] = useState<Intake | null>(null);
   const [busy, setBusy] = useState(false);
@@ -179,8 +186,10 @@ export function IntakeForm() {
         <div className="space-y-1">
           <h1 className="text-lg font-semibold">Preparing your interview…</h1>
           <p className="text-sm text-[var(--muted-foreground)]">
-            Maya is loading the production incident. Use <strong>Chrome</strong> and
-            allow the microphone when asked.
+            {isIncident
+              ? "Maya is loading the production incident."
+              : "Maya is loading your coding problem."}{" "}
+            Use <strong>Chrome</strong> and allow the microphone when asked.
           </p>
           {slow ? (
             <p className="pt-1 text-xs text-[var(--muted-foreground)]">
@@ -206,18 +215,22 @@ export function IntakeForm() {
 
   return (
     <div className="space-y-8">
-      {isIncident && autoState === "error" ? (
+      {isScenario && autoState === "error" ? (
         <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
           Couldn’t auto-start the interview. Click <strong>Generate rubric → Start
           interview</strong> below to launch it manually.
         </div>
       ) : null}
-      {isIncident ? (
+      {isScenario ? (
         <div className="rounded-lg border border-[var(--muted)] p-5 space-y-2">
-          <h2 className="text-lg font-semibold">Software Engineer Incident Demo</h2>
+          <h2 className="text-lg font-semibold">
+            {isIncident ? "Software Engineer Incident Demo" : "SDE Coding Interview"}
+          </h2>
           <p className="text-sm text-[var(--muted-foreground)]">
-            Defaults are pre-filled for a payments backend interview. Two steps:{" "}
-            <strong>Generate rubric → Start interview</strong>.
+            {isIncident
+              ? "Defaults are pre-filled for a payments backend interview."
+              : "Defaults are pre-filled for a software-engineer coding interview."}{" "}
+            Two steps: <strong>Generate rubric → Start interview</strong>.
           </p>
           <p className="text-xs text-[var(--muted-foreground)]">
             Use <strong>Chrome</strong> · allow the microphone when asked · speak

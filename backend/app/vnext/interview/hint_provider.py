@@ -50,6 +50,13 @@ def get_hint_for(session_id: str, intent: str) -> Optional[dict]:
     ladder = session_hints.get(intent)
     if ladder:
         return _fallback_next_hint(session_id, intent, ladder=list(ladder))
+    # scenario-supplied help ladder (per-problem never-reveal hints) — same
+    # ledger-replay escalation, problem-specific content.
+    if intent == "help":
+        from .scenario import get_scenario  # local import: avoid cycle at module load
+        spec = get_scenario(rec.get("track"))
+        if spec is not None and spec.hint_ladder:
+            return _fallback_next_hint(session_id, intent, ladder=list(spec.hint_ladder))
     # fallback
     return _fallback_next_hint(session_id, intent)
 

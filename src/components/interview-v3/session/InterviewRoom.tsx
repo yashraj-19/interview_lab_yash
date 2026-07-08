@@ -45,6 +45,7 @@ import { LedgerPanel } from "./LedgerPanel";
 import { PlaybackBar } from "./PlaybackBar";
 import { CopyReviewLink } from "./CopyReviewLink";
 import { useSpeechToText, useTextToSpeech } from "./useVoice";
+import { API_URL } from "@/lib/api-url";
 
 // Console button/input styles (theme-aware via CSS vars; the editor stays dark).
 const primaryBtn =
@@ -119,6 +120,8 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
   // Incident-demo track: set after mount (the handoff lives in client-only
   // storage, so reading it during render would break SSR hydration).
   const [isIncident, setIsIncident] = useState(false);
+  // Scenario task card text vended by the backend (single source of truth).
+  const [scenarioTask, setScenarioTask] = useState<string | null>(null);
   const [code, setCode] = useState("");
   const [theme, setTheme] = useState<"dark" | "light">("dark");
 
@@ -410,9 +413,13 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
 
       const handoffMode = handoff.mode ?? "mock";
       if (!cancelled) setMode(handoffMode);
-      if (!cancelled && handoff.track === INCIDENT_TRACK) {
+      if (!cancelled && handoff.track) {
+        // Any scenario track gets the hands-free voice room; incident constants
+        // are the instant fallback until the server vends the real content.
         setIsIncident(true);
-        setCode(INCIDENT_SEED_CODE);
+        if (handoff.track === INCIDENT_TRACK) {
+          setCode(INCIDENT_SEED_CODE);
+        }
       }
 
       adapter = makeAdapter({ mode: handoffMode, sessionId, fakeLlm: handoff.fakeLlm, track: handoff.track });
@@ -424,6 +431,32 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
       if (cancelled) {
         void adapter.stop();
         return;
+      }
+
+      // The BACKEND owns scenario content (seed code + task prompt): fetch it
+      // once the session exists server-side, so problem tracks (problem:*) need
+      // zero frontend constants and the incident stops depending on its
+      // duplicated copy. Fallbacks above keep the room usable if this fails.
+      if (handoff.track && handoffMode !== "mock") {
+        void (async () => {
+          try {
+            const res = await fetch(`${API_URL}/vnext/interview/sessions/${sessionId}`);
+            if (!res.ok || cancelled) return;
+            const body = (await res.json()) as {
+              scenario?: { seedCode?: string; taskPrompt?: string; title?: string };
+            };
+            if (cancelled || !body.scenario) return;
+            const seed = body.scenario.seedCode;
+            if (seed) {
+              // Never clobber typing: only preload while the box still holds
+              // nothing or the incident fallback constant.
+              setCode((prev) => (prev === "" || prev === INCIDENT_SEED_CODE ? seed : prev));
+            }
+            if (body.scenario.taskPrompt) setScenarioTask(body.scenario.taskPrompt);
+          } catch {
+            // Backend not reachable — incident fallback text stays.
+          }
+        })();
       }
 
       // ── live-llm: candidate-driven, no playback auto-run ──
@@ -642,7 +675,10 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
           ? "Listening to you"
           : "Awaiting your move";
   const reviewHref = `/lab/interview-v3/session/${sessionId}/review`;
-  const taskText = currentQuestion || (isIncident ? INCIDENT_TASK_PROMPT : "Work through the problem in the editor.");
+  const taskText =
+    currentQuestion ||
+    scenarioTask ||
+    (isIncident ? INCIDENT_TASK_PROMPT : "Work through the problem in the editor.");
 
   // Live AI code actions (Maya): current selection/highlight + the open patch
   // proposal, all derived from the authoritative ledger.

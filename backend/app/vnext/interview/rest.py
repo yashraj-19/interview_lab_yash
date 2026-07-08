@@ -11,7 +11,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from .incident import INCIDENT_TRACK, incident_rubric
+from .scenario import get_scenario, list_problem_scenarios
 from .llm import generate_jd, generate_rubric_llm
 from .models import Intake
 from .phase_controller import PhaseController, TransitionContext
@@ -176,10 +176,12 @@ async def bind_rubric(session_id: str, body: RubricBody) -> dict:
         raise HTTPException(status_code=404, detail="session_not_found")
 
     intake = body.intake.model_dump() if body.intake is not None else rec["intake"]
-    if rec.get("track") == INCIDENT_TRACK:
-        # Deterministic, incident-shaped rubric that rewards code/concurrency/test/
-        # ops/tradeoff evidence — same whether the LLM is live or faked.
-        rubric = incident_rubric(session_id)
+    spec = get_scenario(rec.get("track"))
+    if spec is not None and spec.rubric_factory is not None:
+        # Deterministic, scenario-shaped rubric (incident: code/concurrency/test/
+        # ops/tradeoff; problems: correctness/approach/complexity/testing/comm) —
+        # same whether the LLM is live or faked.
+        rubric = spec.rubric_factory(session_id)
     elif rec.get("mode") == "llm":
         # LLM rubric with deterministic scripted fallback baked in.
         rubric = await generate_rubric_llm(session_id, intake, fake_llm=bool(rec.get("fake_llm")))
@@ -210,19 +212,48 @@ async def bind_rubric(session_id: str, body: RubricBody) -> dict:
     return {"rubric": rubric}
 
 
+@router.get("/problems")
+async def list_problems_endpoint() -> dict:
+    """Problem scenarios available as interview tracks (for the launcher)."""
+    return {
+        "problems": [
+            {
+                "track": s.id,
+                "title": s.title,
+                "difficulty": s.problem.difficulty if s.problem else None,
+                "language": s.language,
+                "runnable": bool(s.problem and s.problem.runnable),
+            }
+            for s in list_problem_scenarios()
+        ]
+    }
+
+
 @router.get("/sessions/{session_id}")
 async def get_session(session_id: str) -> dict:
     rec = STORE.get_session(session_id)
     if rec is None:
         raise HTTPException(status_code=404, detail="session_not_found")
     ledger = STORE.get_ledger(session_id)
-    return {
+    out = {
         "sessionId": session_id,
         "intake": rec["intake"],
         "rubric": rec["rubric"],
         "phase": rec["phase"],
         "lastSeq": ledger.last_seq if ledger else 0,
     }
+    # Scenario content is vended by the BACKEND (single source of truth) so the
+    # frontend no longer needs per-track constants for seed code / task prompt.
+    spec = get_scenario(rec.get("track"))
+    if spec is not None:
+        out["scenario"] = {
+            "track": spec.id,
+            "title": spec.title,
+            "seedCode": spec.seed_code,
+            "taskPrompt": spec.task_prompt,
+            "language": spec.language,
+        }
+    return out
 
 
 @router.get("/sessions/{session_id}/ledger")
