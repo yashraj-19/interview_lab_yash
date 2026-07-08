@@ -169,8 +169,12 @@ def _handle_candidate_text(
         if pause_ms > 0:
             # schedule interviewer utterance later; emit a system.pause.scheduled event
             out.append(_emit(session_id, "system", "system.pause.scheduled", {"intent": intent, "delay_ms": pause_ms}))
-            # return a scheduled marker that the WS loop will pick up and schedule
-            out.append({"scheduled_interviewer": {"payload": hint_fields, "delay_ms": pause_ms}})
+            # return a scheduled marker that the WS loop will pick up and schedule.
+            # trigger_seq = the candidate utterance this hint replies to — the
+            # scheduler uses it to detect that another interviewer line already
+            # answered the candidate during the pause (anti-double gate).
+            out.append({"scheduled_interviewer": {"payload": hint_fields, "delay_ms": pause_ms,
+                                                  "trigger_seq": out[0].get("seq", 0)}})
         else:
             out.append(_emit(session_id, "interviewer", "interviewer.utterance",
                              {"lineId": f"dir-{seq_hint}", **hint_fields}))
@@ -477,10 +481,25 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
         if ev is not None and turn_id not in cancelled_turns:
             await send(ev)
 
-    async def _run_scheduled_interviewer(session_id: str, payload: dict, delay_ms: int) -> None:
+    async def _run_scheduled_interviewer(
+        session_id: str, payload: dict, delay_ms: int, trigger_seq: int = 0
+    ) -> None:
         # Sleep and then emit the interviewer. Append event at send-time.
         try:
             await asyncio.sleep(delay_ms / 1000.0)
+            # Anti-double gate (Voice_Assist reply_already_handled, ledger-native):
+            # if ANY interviewer line already landed after the candidate utterance
+            # this hint was replying to (e.g. an LLM turn raced in during the
+            # pause), the candidate has been answered — emitting the hint now
+            # would be a second, stale reply. Cancel instead, auditable.
+            if trigger_seq and any(
+                e.get("type") == "interviewer.utterance"
+                for e in STORE.get_events(session_id, trigger_seq)
+            ):
+                await send(_emit(session_id, "system", "system.pause.cancelled",
+                                 {"intent": payload.get("hint_for"), "delay_ms": delay_ms,
+                                  "reason": "superseded"}))
+                return
             ev = _emit(session_id, "interviewer", "interviewer.utterance", {"lineId": f"dir-{STORE.get_ledger(session_id).last_seq + 1}", **payload})
             await send(ev)
             # emit completed marker
@@ -636,8 +655,11 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
                         si = ev["scheduled_interviewer"]
                         payload = si.get("payload") or {}
                         delay_ms = int(si.get("delay_ms", 0) or 0)
+                        trigger_seq = int(si.get("trigger_seq", 0) or 0)
                         # create background task to run scheduled interviewer
-                        task = asyncio.create_task(_run_scheduled_interviewer(session_id, payload, delay_ms))
+                        task = asyncio.create_task(
+                            _run_scheduled_interviewer(session_id, payload, delay_ms, trigger_seq)
+                        )
                         # attach metadata for cancellation reporting
                         try:
                             setattr(task, "scheduled_meta", {"payload": payload, "delay_ms": delay_ms})

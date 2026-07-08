@@ -50,6 +50,11 @@ export interface UseSpeechToTextOptions {
   shouldIgnoreResult?: (text: string) => boolean;
   /** Fired the moment speech is detected — used for barge-in (stop the TTS). */
   onSpeechStart?: () => void;
+  /** Fired for EVERY passing (non-ignored) recognition result with the full
+   * heard text (final + interim). Unlike onSpeechStart (one-shot per
+   * recognizer instance), this lets the caller run per-result decisions —
+   * the semantic barge-in gate and auto-send timer management. */
+  onResult?: (heard: string, isFinal: boolean) => void;
   win?: VoiceWindow;
   lang?: string;
 }
@@ -123,6 +128,7 @@ export function useSpeechToText(opts: UseSpeechToTextOptions): SpeechToText {
         sawSpeech = true;
         cbRef.current.onSpeechStart?.();
       }
+      if (heard) cbRef.current.onResult?.(heard, Boolean(finalText));
       setInterim(interimText);
       cbRef.current.onInterim?.(interimText);
       if (finalText) {
@@ -178,6 +184,10 @@ export interface TextToSpeech {
   speak: (text: string) => void;
   replay: () => void;
   cancel: () => void;
+  /** Pre-fetch and cache the audio for short lines (latency-masking fillers)
+   * so a later speak() of the same text plays instantly with zero round-trip.
+   * Fire-and-forget; failures (no key/offline) just leave the cache empty. */
+  prime: (texts: readonly string[]) => void;
 }
 
 interface MinimalResponse {
@@ -222,6 +232,8 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
   const lastTextRef = useRef<string>("");
   const audioRef = useRef<PlayableAudio | null>(null);
   const genRef = useRef(0);
+  // Primed audio blobs keyed by sanitized text — instant playback for fillers.
+  const primedRef = useRef<Map<string, Blob>>(new Map());
 
   const optsRef = useRef(opts);
   useEffect(() => {
@@ -320,6 +332,30 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
       const audioFactory =
         o.audioFactory ?? ((url: string) => new Audio(url) as unknown as PlayableAudio);
 
+      // Primed cache first: instant playback, no round-trip (fillers).
+      const primed = primedRef.current.get(clean);
+      if (primed && makeUrl) {
+        const url = makeUrl(primed);
+        const audio = audioFactory(url);
+        audio.muted = false;
+        audio.volume = INTERVIEWER_AUDIO_VOLUME;
+        audioRef.current = audio;
+        const finish = () => {
+          if (gen === genRef.current) setSpeaking(false);
+          revoke?.(url);
+        };
+        audio.onended = finish;
+        audio.onerror = finish;
+        try {
+          await audio.play();
+          if (gen === genRef.current) setEngine("sia");
+          return;
+        } catch {
+          if (gen !== genRef.current) return; // canceled mid-play
+          // fall through to the normal path
+        }
+      }
+
       // Primary path: ElevenLabs demo voice via the lab endpoint.
       if (fetchImpl && makeUrl) {
         try {
@@ -384,8 +420,37 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
     });
   }, [cancel]);
 
+  // Pre-fetch short lines into the blob cache (fire-and-forget). Failures are
+  // silent: an unprimed text just takes the normal fetch path later.
+  const prime = useCallback(
+    (texts: readonly string[]) => {
+      const o = optsRef.current;
+      const fetchImpl =
+        o.fetchImpl ??
+        (globalThis.fetch?.bind(globalThis) as unknown as UseTextToSpeechOptions["fetchImpl"]);
+      if (!fetchImpl) return;
+      for (const text of texts) {
+        const clean = sanitizeForSpeech(text);
+        if (!clean || primedRef.current.has(clean)) continue;
+        void (async () => {
+          try {
+            const res = await fetchImpl(endpoint, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ text: clean }),
+            });
+            if (res.ok) primedRef.current.set(clean, await res.blob());
+          } catch {
+            // offline / no key — cache stays empty, speak() falls back normally
+          }
+        })();
+      }
+    },
+    [endpoint],
+  );
+
   // Cancel speech on unmount.
   useEffect(() => () => cancel(), [cancel]);
 
-  return { supported, muted, speaking, engine, toggleMute, speak, replay, cancel };
+  return { supported, muted, speaking, engine, toggleMute, speak, replay, cancel, prime };
 }

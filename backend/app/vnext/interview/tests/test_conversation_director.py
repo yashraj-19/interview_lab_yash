@@ -79,3 +79,41 @@ def test_help_intent_emits_hint_without_revealing_answer(client):
         assert "hint" in text or "next step" in text or "focus" in text
         assert "unique constraint" not in text
         assert "idempotency key" not in text
+
+
+def test_scheduled_hint_superseded_by_interviewer_reply(client):
+    """Anti-double gate: a pause-scheduled hint must NOT fire if another
+    interviewer line already answered the candidate during the pause —
+    it is cancelled with reason=superseded instead (one reply per turn)."""
+    sid = _make_llm_session(client)
+    # Schedule help hints 400ms out so an advance can race in during the pause.
+    client.patch(f"/vnext/interview/sessions/{sid}/pause_policies", json={"help": 400})
+
+    with client.websocket_connect(f"/vnext/interview/ws/{sid}") as ws:
+        ws.send_json(_hello(sid))
+        ws.receive_json(); ws.receive_json()
+
+        ws.send_json({"type": "candidate.text", "text": "I'm stuck, can you guide me?"})
+        assert ws.receive_json()["type"] == "candidate.utterance"
+        assert ws.receive_json()["type"] == "conversation.intent.detected"
+        assert ws.receive_json()["type"] == "system.pause.scheduled"
+
+        # An interviewer line lands during the pause (scripted advance).
+        ws.send_json({"type": "advance.request", "signal": "session.start"})
+        got_interviewer_line = False
+        outcome = None  # "superseded" | "hint_fired"
+        for _ in range(20):  # drain until the scheduler resolves
+            ev = ws.receive_json()
+            if ev["type"] == "interviewer.utterance":
+                if ev.get("hint_for") == "help":
+                    outcome = "hint_fired"
+                    break
+                got_interviewer_line = True
+            elif ev["type"] == "system.pause.cancelled" and ev.get("reason") == "superseded":
+                outcome = "superseded"
+                break
+            elif ev["type"] == "system.pause.completed":
+                outcome = "hint_fired"
+                break
+        assert got_interviewer_line, "the advance should have produced an interviewer line"
+        assert outcome == "superseded", f"scheduled hint should be superseded, got {outcome}"

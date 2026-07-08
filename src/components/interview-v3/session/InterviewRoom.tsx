@@ -31,6 +31,12 @@ import {
   type BargeState,
 } from "@/lib/interview-v3/voice";
 import {
+  FILLER_LINES,
+  decideBargeIn,
+  decideTurnEnd,
+  pickFiller,
+} from "@/lib/interview-v3/turn-taking";
+import {
   INCIDENT_SEED_CODE,
   INCIDENT_TASK_PROMPT,
   INCIDENT_TRACK,
@@ -155,6 +161,35 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
   const [bargeState, dispatchBarge] = useReducer(nextBargeState, "idle" as BargeState);
   const suppressSpeakRef = useRef(false);
 
+  // ── semantic barge-in gate state ───────────────────────────────────────────
+  // While Maya is speaking, only a REAL interruption takes the floor: a cut-in
+  // word ("wait", "stop"…), ≥3 non-backchannel words, or sustained speech.
+  // Backchannels ("mm-hm", "yeah") never cut her off. One barge per speaking
+  // episode; re-armed when a new turn starts speaking.
+  const speechOnsetRef = useRef<number | null>(null);
+  const bargedThisTurnRef = useRef(false);
+
+  const executeBargeIn = () => {
+    if (bargedThisTurnRef.current) return;
+    bargedThisTurnRef.current = true;
+    dispatchBarge("speech_start");
+    ttsRef.current.cancel(); // stop interviewer audio immediately (client)
+    suppressSpeakRef.current = true; // an in-flight / just-arrived turn won't auto-speak
+    // Tell the backend to cancel the in-flight interviewer generation so its
+    // late LLM output never streams back as the active question.
+    const led = adapterRef.current?.getLedger() ?? [];
+    let activeTurnId: string | undefined;
+    for (let i = led.length - 1; i >= 0; i--) {
+      const e = led[i];
+      if (e.type === "interviewer.turn.started") {
+        activeTurnId = e.turnId;
+        break;
+      }
+    }
+    adapterRef.current?.bargeIn(activeTurnId);
+    dispatchBarge("interrupt_done");
+  };
+
   const stt = useSpeechToText({
     onFinalTranscript: (chunk) => {
       const merged = appendFinal(answerRef.current, chunk);
@@ -162,40 +197,40 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
       dispatchBarge("final");
       dispatchBarge("answer_ready");
       if (voiceAutoRef.current) {
-        // Hands-free: wait for a short pause, then send the whole spoken answer
-        // as one turn (which advances → Maya replies by voice).
+        // Hands-free: semantic turn-end (Voice_Assist rule) instead of a fixed
+        // timer — trailing continuation tokens ("so I think we could…") wait
+        // long, complete-sounding endings confirm fast, neutral endings sit in
+        // between. The delay restarts on any further speech.
         if (sendTimerRef.current) window.clearTimeout(sendTimerRef.current);
-        sendTimerRef.current = window.setTimeout(() => {
-          const text = answerRef.current.trim();
-          if (text) handleSendAnswer(adapterRef.current?.getPhase() ?? "ready", text);
-        }, 1600);
+        const decision = decideTurnEnd(merged);
+        if (decision.delayMs !== null) {
+          sendTimerRef.current = window.setTimeout(() => {
+            const text = answerRef.current.trim();
+            if (text) handleSendAnswer(adapterRef.current?.getPhase() ?? "ready", text);
+          }, decision.delayMs);
+        }
       }
     },
     shouldIgnoreResult: (text) =>
       ttsRef.current.speaking && isLikelySpeechEcho(text, speakingMayaTextRef.current),
-    // Full barge-in: the instant the candidate speaks, take the floor.
-    onSpeechStart: () => {
-      // Still talking — cancel any pending auto-send so we don't cut the answer.
+    // Every passing recognition result: manage the auto-send timer and run the
+    // barge-in gate. (onSpeechStart is one-shot per recognizer instance, so the
+    // per-result stream is what keeps barge-in working all session long.)
+    onResult: (heard) => {
+      // Candidate is (still) talking — never cut their answer off mid-speech.
       if (sendTimerRef.current) {
         window.clearTimeout(sendTimerRef.current);
         sendTimerRef.current = null;
       }
-      dispatchBarge("speech_start");
-      ttsRef.current.cancel(); // stop interviewer audio immediately (client)
-      suppressSpeakRef.current = true; // an in-flight / just-arrived turn won't auto-speak
-      // Tell the backend to cancel the in-flight interviewer generation so its
-      // late LLM output never streams back as the active question.
-      const led = adapterRef.current?.getLedger() ?? [];
-      let activeTurnId: string | undefined;
-      for (let i = led.length - 1; i >= 0; i--) {
-        const e = led[i];
-        if (e.type === "interviewer.turn.started") {
-          activeTurnId = e.turnId;
-          break;
-        }
+      if (ttsRef.current.speaking) {
+        if (speechOnsetRef.current === null) speechOnsetRef.current = Date.now();
+        const sustainedMs = Date.now() - speechOnsetRef.current;
+        if (decideBargeIn(heard, sustainedMs) === "interrupt") executeBargeIn();
+      } else {
+        // Floor is free: speaking is just answering.
+        speechOnsetRef.current = null;
+        dispatchBarge("speech_start");
       }
-      adapterRef.current?.bargeIn(activeTurnId);
-      dispatchBarge("interrupt_done");
     },
   });
 
@@ -242,11 +277,15 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isIncident, ready, joined, stt.supported]);
 
-  // Interviewer audio finishing naturally returns the floor to idle.
+  // Interviewer audio finishing naturally returns the floor to idle, and every
+  // speaking transition re-arms the barge-in gate for the next episode.
   const prevSpeakingRef = useRef(false);
   useEffect(() => {
     if (prevSpeakingRef.current && !tts.speaking) dispatchBarge("interviewer_done");
     prevSpeakingRef.current = tts.speaking;
+    speechOnsetRef.current = null;
+    bargedThisTurnRef.current = false;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tts.speaking]);
 
   // Speak each NEW interviewer turn exactly once (mute honored inside speak()).
@@ -278,6 +317,40 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
     ttsRef.current.speak(latest.text);
     dispatchBarge("interviewer_start");
   }, [isLlm, llmLedger, revealed, liveExtra]);
+
+  // ── latency masking ────────────────────────────────────────────────────────
+  // The moment a turn STARTS generating (interviewer.turn.started arrives
+  // synchronously, before the LLM+TTS round-trip), speak a short pre-cached
+  // filler ("Hm.", "Right, let me think.") so the room never sits in dead air.
+  // The real utterance supersedes it via the TTS generation counter; a barge-in
+  // cancels it like any other speech.
+  useEffect(() => {
+    if (isLlm && ready) ttsRef.current.prime(FILLER_LINES);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLlm, ready]);
+  const fillerSeqRef = useRef(-1);
+  useEffect(() => {
+    if (!isLlm) return;
+    let started: { seq: number } | null = null;
+    let answered = false;
+    for (let i = llmLedger.length - 1; i >= 0; i--) {
+      const e = llmLedger[i];
+      if (e.type === "interviewer.utterance") {
+        answered = true; // newest activity is already a spoken line
+        break;
+      }
+      if (e.type === "interviewer.turn.started") {
+        started = { seq: e.seq };
+        break;
+      }
+    }
+    if (!started || answered || started.seq === fillerSeqRef.current) return;
+    fillerSeqRef.current = started.seq;
+    if (suppressSpeakRef.current || ttsRef.current.speaking) return;
+    const filler = pickFiller(started.seq);
+    speakingMayaTextRef.current = filler; // echo filter must cover the filler too
+    ttsRef.current.speak(filler);
+  }, [isLlm, llmLedger]);
 
   // Keep the transcript pinned to the latest line.
   useEffect(() => {
