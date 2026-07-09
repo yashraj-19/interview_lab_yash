@@ -80,8 +80,11 @@ _CLASSIFIER = get_classifier()
 # (never a hint — hints are earned via the help ladder), then one check-in.
 # Constants are module-level so tests can shrink them.
 _SILENCE_POLL_SECS = 5.0
-_SILENCE_FIRST_SECS = 25.0
-_SILENCE_SECOND_SECS = 50.0
+# Tuned from live runs: 25s nudged candidates who were genuinely thinking
+# ("can you give me a minute") and made Maya feel naggy. Real interviewers
+# hold longer silences than feels comfortable.
+_SILENCE_FIRST_SECS = 45.0
+_SILENCE_SECOND_SECS = 90.0
 _SILENCE_NUDGES = (
     "Talk me through what you're thinking — half-formed is fine.",
     "Still with me? Say what you're weighing, or tell me if you'd like the question rephrased.",
@@ -581,7 +584,7 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
         a cancellable task so a barge-in kills it mid-generation with nothing
         emitted (the LLM call is awaited BEFORE any event is minted)."""
         try:
-            events = await conversation.substantive_turn(session_id, text)
+            events = await conversation.substantive_turn(session_id, text, turn_id)
         except asyncio.CancelledError:
             return
         finally:
@@ -819,7 +822,14 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
                     await send(_emit(session_id, "candidate", "candidate.utterance", cand_payload))
 
                     if substantive:
+                        # turn.started BEFORE generation: the client's latency-
+                        # masking filler keys off it, and barge_in can target the
+                        # in-flight reactive turn by id — same contract as
+                        # advance-driven turns.
                         turn_id = f"conv-{cand_seq}"
+                        await send(_emit(session_id, "system", "interviewer.turn.started",
+                                         {"turnId": turn_id,
+                                          "phase": (sess or {}).get("phase", "")}))
                         active_turns[turn_id] = asyncio.create_task(
                             run_conversation_turn(text_str, turn_id)
                         )

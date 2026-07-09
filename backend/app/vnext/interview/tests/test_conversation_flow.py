@@ -146,6 +146,19 @@ def _hello(sid):
             "last_seq": 0, "resume": False}
 
 
+
+def _frames_until_reply(ws, max_frames=8):
+    """Collect frames until Maya's utterance (reactive turns now emit
+    interviewer.turn.started before generating, and may emit phase.changed)."""
+    frames = []
+    for _ in range(max_frames):
+        f = ws.receive_json()
+        frames.append(f)
+        if f["type"] == "interviewer.utterance":
+            break
+    return frames
+
+
 def _start(ws, sid):
     ws.send_json(_hello(sid)); ws.receive_json(); ws.receive_json()
     ws.send_json({"type": "advance.request", "signal": "session.start"})
@@ -160,9 +173,11 @@ def test_i_dont_know_stays_in_phase_and_narrows_down(client, monkeypatch):
         _start(ws, sid)
         ws.send_json({"type": "candidate.text", "text": "I don't know."})
         assert ws.receive_json()["type"] == "candidate.utterance"
-        intent = ws.receive_json()
-        assert intent["type"] == "conversation.intent.detected"
-        reply = ws.receive_json()
+        frames = _frames_until_reply(ws)
+        types = [f["type"] for f in frames]
+        assert "interviewer.turn.started" in types  # filler hook fires for reactive turns
+        assert "conversation.intent.detected" in types
+        reply = frames[-1]
         assert reply["type"] == "interviewer.utterance"
         assert "which part" in reply["text"].lower()
     ledger = client.get(f"/vnext/interview/sessions/{sid}/ledger").json()["events"]
@@ -205,8 +220,8 @@ def test_partial_answer_gets_a_follow_up_and_stays(client, monkeypatch):
     with client.websocket_connect(f"/vnext/interview/ws/{sid}") as ws:
         _start(ws, sid)
         ws.send_json({"type": "candidate.text", "text": "I'd add a second db check after the provider call."})
-        ws.receive_json(); ws.receive_json()  # candidate.utterance, intent
-        reply = ws.receive_json()
+        assert ws.receive_json()["type"] == "candidate.utterance"
+        reply = _frames_until_reply(ws)[-1]
         assert reply["type"] == "interviewer.utterance"
         assert reply.get("isFollowUp") is True
         assert "concurrent retries" in reply["text"].lower()
@@ -223,10 +238,12 @@ def test_probes_deeper_before_advancing_a_technical_phase(client, monkeypatch):
         _start(ws, sid)
         # Answer 1 (advance=True): intro floor is 1 -> advances to resume_calibration.
         ws.send_json({"type": "candidate.text", "text": "I own the payments service end to end."})
-        ws.receive_json(); ws.receive_json(); ws.receive_json()  # utt, intent, reply
+        assert ws.receive_json()["type"] == "candidate.utterance"
+        _frames_until_reply(ws)
         # Answer 2 (advance=True): resume_calibration turn 1 < floor 2 -> stays.
         ws.send_json({"type": "candidate.text", "text": "I designed the idempotency layer."})
-        ws.receive_json(); ws.receive_json(); ws.receive_json()
+        assert ws.receive_json()["type"] == "candidate.utterance"
+        _frames_until_reply(ws)
     ledger = client.get(f"/vnext/interview/sessions/{sid}/ledger").json()["events"]
     phases = [e["to"] for e in ledger if e["type"] == "phase.changed"]
     # Advanced intro->resume_calibration exactly once; did NOT skip ahead on the
@@ -258,6 +275,7 @@ def test_barge_in_cancels_a_reactive_turn_with_nothing_spoken(client, monkeypatc
         _start(ws, sid)
         ws.send_json({"type": "candidate.text", "text": "here is my full reasoning about the race"})
         assert ws.receive_json()["type"] == "candidate.utterance"
+        assert ws.receive_json()["type"] == "interviewer.turn.started"
         # Barge in while the reactive turn is still generating.
         ws.send_json({"type": "barge_in"})
         assert ws.receive_json()["type"] == "interviewer.cancelled"

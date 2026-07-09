@@ -117,6 +117,7 @@ def test_next_turn_after_barge_in_sees_candidate_answer(client, monkeypatch):
         # that includes the answer.
         ws.send_json({"type": "candidate.text", "text": "I used a unique idempotency key per charge."})
         assert ws.receive_json()["type"] == "candidate.utterance"
+        ws.receive_json()  # interviewer.turn.started
         ws.receive_json()  # conversation.intent.detected
         utter = ws.receive_json()  # the reactive interviewer reply
         assert utter["type"] == "interviewer.utterance"

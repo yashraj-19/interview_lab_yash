@@ -122,7 +122,7 @@ def _phase(session_id: str) -> str:
     return (rec or {}).get("phase", "intro")
 
 
-async def substantive_turn(session_id: str, candidate_text: str) -> list[dict]:
+async def substantive_turn(session_id: str, candidate_text: str, turn_id: str | None = None) -> list[dict]:
     """Reactive turn for a real answer: understand it, respond in-phase, and
     advance ONLY if the phase is genuinely complete. Returns the ordered events
     to emit (the LLM call happens first so a barge-in can cancel with nothing
@@ -193,6 +193,8 @@ async def substantive_turn(session_id: str, candidate_text: str) -> list[dict]:
         # repeated); a phase-opening line is not.
         "isFollowUp": not advance,
     }
+    if turn_id:
+        payload["turnId"] = turn_id
     if result["note"]:
         payload["note"] = result["note"]
     if guard_reasons:

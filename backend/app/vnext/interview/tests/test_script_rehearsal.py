@@ -128,6 +128,7 @@ def test_barge_in_moment_hold_on_yields_the_floor(client, monkeypatch):
         ws.send_json({"type": "candidate.text",
                       "text": "The core issue is the external provider call is not safely tied to our database write."})
         assert ws.receive_json()["type"] == "candidate.utterance"
+        ws.receive_json()  # interviewer.turn.started
         ws.receive_json()  # conversation.intent.detected
         reply = ws.receive_json()
         assert reply["type"] == "interviewer.utterance"
@@ -155,6 +156,7 @@ def test_wrong_answer_moment_pushback_without_verdict(client, monkeypatch):
         # open "That's wrong", and the guard must strip the verdict.
         ws.send_json({"type": "candidate.text", "text": "Maybe we can just increase the timeout."})
         assert ws.receive_json()["type"] == "candidate.utterance"
+        ws.receive_json()  # interviewer.turn.started (reactive-turn filler hook)
         ws.receive_json()  # conversation.intent.detected
         utter = ws.receive_json()
 

@@ -120,6 +120,8 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
   // Incident-demo track: set after mount (the handoff lives in client-only
   // storage, so reading it during render would break SSR hydration).
   const [isIncident, setIsIncident] = useState(false);
+  // Which scenario family — drives arc labels/copy ("Patch" vs "Approach").
+  const [trackKind, setTrackKind] = useState<"incident" | "problem" | null>(null);
   // Scenario task card text vended by the backend (single source of truth).
   const [scenarioTask, setScenarioTask] = useState<string | null>(null);
   // Truthful WS connection state (live modes): the transport reports
@@ -181,6 +183,7 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
     bargedThisTurnRef.current = true;
     dispatchBarge("speech_start");
     ttsRef.current.cancel(); // stop interviewer audio immediately (client)
+    clearSpeakQueue(); // queued-but-unspoken lines yield too (their text reveals)
     suppressSpeakRef.current = true; // an in-flight / just-arrived turn won't auto-speak
     // Tell the backend to cancel the in-flight interviewer generation so its
     // late LLM output never streams back as the active question.
@@ -295,23 +298,41 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tts.speaking]);
 
-  // Speak each NEW interviewer turn exactly once (mute honored inside speak()).
-  // If the candidate barged in, the turn lands in the ledger but is NOT spoken.
+  // ── speak QUEUE (mute honored inside speak()) ─────────────────────────────
+  // Interviewer lines can arrive in quick succession (a reactive reply chased
+  // by a silence nudge). Newest-wins superseded the first line's audio mid-
+  // synthesis — text appeared but was never heard (observed live). Every
+  // unspoken line is queued and spoken IN ORDER; a barge-in clears the queue.
   //
-  // VOICE/TEXT SYNC: the ledger event arrives seconds before the TTS audio
-  // does (synth round-trip), and reading Maya's line before hearing it breaks
-  // the live feel. So the newest line is HIDDEN from the transcript until her
-  // audio actually starts (speak()'s onStart), with a failsafe reveal so text
-  // can never be lost if playback fails or is muted mid-flight.
-  const spokenSeqRef = useRef(-1);
-  const [hiddenSpeakSeq, setHiddenSpeakSeq] = useState<number | null>(null);
-  const revealTimerRef = useRef<number | null>(null);
-  const revealNow = () => {
-    if (revealTimerRef.current) {
-      window.clearTimeout(revealTimerRef.current);
-      revealTimerRef.current = null;
-    }
-    setHiddenSpeakSeq(null);
+  // VOICE/TEXT SYNC: each queued line stays HIDDEN from the transcript until
+  // its audio actually starts (speak()'s onStart), with a failsafe reveal so
+  // text can never be lost if playback fails or is muted mid-flight.
+  const enqueuedSeqRef = useRef(-1);
+  const speakQueueRef = useRef<{ seq: number; text: string; turnId?: string }[]>([]);
+  const [hiddenSeqs, setHiddenSeqs] = useState<number[]>([]);
+  const revealTimersRef = useRef(new Map<number, number>());
+  const revealSeq = (seq: number) => {
+    const t = revealTimersRef.current.get(seq);
+    if (t) window.clearTimeout(t);
+    revealTimersRef.current.delete(seq);
+    setHiddenSeqs((h) => h.filter((s) => s !== seq));
+  };
+  const hideSeq = (seq: number) => {
+    setHiddenSeqs((h) => (h.includes(seq) ? h : [...h, seq]));
+    const t = window.setTimeout(() => revealSeq(seq), 8000);
+    revealTimersRef.current.set(seq, t);
+  };
+  const clearSpeakQueue = () => {
+    for (const item of speakQueueRef.current) revealSeq(item.seq);
+    speakQueueRef.current = [];
+  };
+  const pumpSpeakQueue = () => {
+    if (ttsRef.current.speaking) return; // next line starts when this one ends
+    const next = speakQueueRef.current.shift();
+    if (!next) return;
+    speakingMayaTextRef.current = next.text;
+    ttsRef.current.speak(next.text, () => revealSeq(next.seq));
+    dispatchBarge("interviewer_start");
   };
   useEffect(() => {
     const src = isLlm ? llmLedger : [...revealed, ...liveExtra];
@@ -320,39 +341,27 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
     const cancelled = new Set<string>();
     for (const e of src) if (e.type === "interviewer.cancelled") cancelled.add(e.turnId);
 
-    let latest: { seq: number; text: string; turnId?: string } | null = null;
-    for (let i = src.length - 1; i >= 0; i--) {
-      const e = src[i];
-      if (e.type === "interviewer.utterance") {
-        latest = { seq: e.seq, text: e.text, turnId: e.turnId };
-        break;
+    for (const e of src) {
+      if (e.type !== "interviewer.utterance" || e.seq <= enqueuedSeqRef.current) continue;
+      enqueuedSeqRef.current = e.seq;
+      if (suppressSpeakRef.current) {
+        // Barged-in turn: keep it in the ledger, just don't speak it.
+        suppressSpeakRef.current = false;
+        continue;
       }
+      if (e.turnId && cancelled.has(e.turnId)) continue;
+      if (tts.supported && !tts.muted) hideSeq(e.seq);
+      speakQueueRef.current.push({ seq: e.seq, text: e.text, turnId: e.turnId });
     }
-    if (!latest || latest.seq === spokenSeqRef.current) return;
-    spokenSeqRef.current = latest.seq;
-    if (suppressSpeakRef.current || (latest.turnId && cancelled.has(latest.turnId))) {
-      // Barged-in / cancelled turn: keep it in the ledger, just don't speak it.
-      suppressSpeakRef.current = false;
-      return;
-    }
-    speakingMayaTextRef.current = latest.text;
-    if (tts.supported && !tts.muted) {
-      const seq = latest.seq;
-      setHiddenSpeakSeq(seq);
-      if (revealTimerRef.current) window.clearTimeout(revealTimerRef.current);
-      // Failsafe: never keep text hidden longer than the synth could plausibly
-      // take — if audio hasn't started by then, show the words anyway.
-      revealTimerRef.current = window.setTimeout(() => {
-        revealTimerRef.current = null;
-        setHiddenSpeakSeq((cur) => (cur === seq ? null : cur));
-      }, 3500);
-      ttsRef.current.speak(latest.text, revealNow);
-    } else {
-      ttsRef.current.speak(latest.text);
-    }
-    dispatchBarge("interviewer_start");
+    pumpSpeakQueue();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLlm, llmLedger, revealed, liveExtra]);
+
+  // When one line finishes, the next queued line speaks.
+  useEffect(() => {
+    if (!tts.speaking) pumpSpeakQueue();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tts.speaking]);
 
   // ── latency masking ────────────────────────────────────────────────────────
   // The moment a turn STARTS generating (interviewer.turn.started arrives
@@ -450,6 +459,7 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
         // Any scenario track gets the hands-free voice room; incident constants
         // are the instant fallback until the server vends the real content.
         setIsIncident(true);
+        setTrackKind(handoff.track === INCIDENT_TRACK ? "incident" : "problem");
         if (handoff.track === INCIDENT_TRACK) {
           setCode(INCIDENT_SEED_CODE);
         }
@@ -693,9 +703,9 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
   }
 
   const ledger = isLlm ? [...llmLedger] : [...revealed, ...liveExtra];
-  // Voice/text sync: the newest interviewer line stays out of the visible
-  // transcript until her audio starts (or the failsafe reveals it).
-  const transcript = selectTranscript(ledger).filter((t) => t.seq !== hiddenSpeakSeq);
+  // Voice/text sync: unspoken interviewer lines stay out of the visible
+  // transcript until their audio starts (or the failsafe reveals them).
+  const transcript = selectTranscript(ledger).filter((t) => !hiddenSeqs.includes(t.seq));
   const codeState = selectCode(ledger);
   const runs = selectRuns(ledger);
   const phase: Phase = selectCurrentPhase(ledger, "ready");
@@ -786,7 +796,7 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
               Interview arc
             </p>
             <div className="mt-3 space-y-2.5">
-              {INCIDENT_ARC.map((label, i) => (
+              {(trackKind === "problem" ? PROBLEM_ARC : INCIDENT_ARC).map((label, i) => (
                 <ArcStep key={label} label={label} done={i < arcIdx} active={i === arcIdx} />
               ))}
             </div>
@@ -877,7 +887,8 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
           {/* current task / question */}
           <div className="border-b border-[var(--rp-edge)] bg-emerald-300/[0.04] px-4 py-3">
             <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--rp-accent)]">
-              {isIncident ? "Incident task" : "Task"} · {humanPhase(phase)}
+              {trackKind === "problem" ? "Problem task" : isIncident ? "Incident task" : "Task"} ·{" "}
+              {humanPhase(phase, trackKind !== "problem")}
             </p>
             <p className="mt-1 text-sm leading-6 text-[var(--rp-ink)]">{taskText}</p>
           </div>
@@ -1220,7 +1231,7 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
   );
 }
 
-// ── interview arc (incident-shaped, human-facing) ──────────────────────────────
+// ── interview arc (scenario-aware, human-facing) ───────────────────────────────
 const INCIDENT_ARC = [
   "Incident",
   "Failure mode",
@@ -1228,6 +1239,17 @@ const INCIDENT_ARC = [
   "Concurrency",
   "Test",
   "Operations",
+  "Wrap-up",
+];
+// Generic coding-interview arc for problem tracks (Two Sum, Binary Search, …)
+// — a Two Sum run must never show "Patch"/"Operations" labels.
+const PROBLEM_ARC = [
+  "Problem",
+  "Approach",
+  "Optimize",
+  "Coding",
+  "Testing",
+  "Complexity",
   "Wrap-up",
 ];
 const PHASE_SEQUENCE: Phase[] = [
@@ -1246,19 +1268,32 @@ function arcIndexForPhase(phase: Phase): number {
 }
 
 /** Friendly, candidate-facing phase label (no raw state-machine names). */
-function humanPhase(phase: Phase): string {
-  const map: Partial<Record<Phase, string>> = {
-    ready: "Starting",
-    intro: "Opening",
-    resume_calibration: "Failure mode",
-    problem_framing: "Patch",
-    coding: "Implementation",
-    debugging: "Testing",
-    optimization: "Operations",
-    wrap_up: "Wrap-up",
-    scoring: "Scoring",
-    review: "Review",
-  };
+function humanPhase(phase: Phase, incident: boolean): string {
+  const map: Partial<Record<Phase, string>> = incident
+    ? {
+        ready: "Starting",
+        intro: "Opening",
+        resume_calibration: "Failure mode",
+        problem_framing: "Patch",
+        coding: "Implementation",
+        debugging: "Testing",
+        optimization: "Operations",
+        wrap_up: "Wrap-up",
+        scoring: "Scoring",
+        review: "Review",
+      }
+    : {
+        ready: "Starting",
+        intro: "Opening",
+        resume_calibration: "Approach",
+        problem_framing: "Optimize",
+        coding: "Coding",
+        debugging: "Testing",
+        optimization: "Complexity",
+        wrap_up: "Wrap-up",
+        scoring: "Scoring",
+        review: "Review",
+      };
   return map[phase] ?? "In progress";
 }
 
