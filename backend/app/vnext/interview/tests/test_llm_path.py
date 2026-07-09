@@ -21,11 +21,18 @@ from app.vnext.interview.router import router
 CONN_ID = "conn-test-0001-abcd"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_provider_keys(monkeypatch):
+    """Enforce this module's NO-network contract: a developer's REAL keys in
+    backend/.env must never leak into these tests (each test sets exactly the
+    fake keys it needs)."""
+    for field in ("openrouter_api_key", "groq_api_key", "gemini_api_key", "openai_api_key"):
+        monkeypatch.setattr(settings, field, "", raising=False)
+
+
 # ── provider abstraction ──────────────────────────────────────────────────────
 
-def test_no_keys_raises_unavailable(monkeypatch):
-    monkeypatch.setattr(settings, "openrouter_api_key", "", raising=False)
-    monkeypatch.setattr(settings, "openai_api_key", "", raising=False)
+def test_no_keys_raises_unavailable():
     with pytest.raises(LLMUnavailable):
         asyncio.run(call_llm([{"role": "user", "content": "hi"}]))
 
