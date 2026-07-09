@@ -113,8 +113,11 @@ async def _chat_completion(url: str, headers: dict, body: dict, timeout: float) 
     """POST an OpenAI-compatible chat/completions request and return content.
 
     Isolated so unit tests can monkeypatch it with a fake response and never
-    touch the network.
+    touch the network. An explicit User-Agent is set because some provider
+    edges (observed: Groq/Cloudflare) 403-block default library agents —
+    which reads as an invalid key when it's really a blocked request.
     """
+    headers = {"User-Agent": "sviam-interview-lab/1.0", **headers}
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(url, headers=headers, json=body)
         resp.raise_for_status()
