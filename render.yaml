@@ -1,0 +1,69 @@
+# Render blueprint — SViam Interview Lab (backend + frontend).
+#
+# Deploy: Render dashboard → New → Blueprint → point at this repo. The two
+# services wire their URLs into each other automatically (fromService), so
+# the only secrets to enter by hand are the API keys (sync: false).
+#
+# Lab constraints that shape this file:
+# - The store is IN-MEMORY: exactly one instance (numInstances: 1), and a
+#   deploy/restart wipes live sessions. Fine for demos; don't autoscale.
+# - Free plan instances sleep after idle → the first request after a quiet
+#   period takes ~1 min to cold-start. Upgrade the plan for a senior demo,
+#   or hit /vnext/interview/warmup a minute before you start.
+# - WebSockets are supported on Render out of the box (wss:// on https).
+
+services:
+  # ── FastAPI backend ────────────────────────────────────────────────────────
+  - type: web
+    name: sviam-lab-backend
+    runtime: python
+    rootDir: backend
+    plan: free
+    numInstances: 1
+    buildCommand: pip install -r requirements.txt
+    # Single uvicorn worker (per-process in-memory store + WS state).
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /vnext/interview/warmup
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.0
+      # Live LLM interviewer/rubric/scorecard. Provider order:
+      # OpenRouter → Groq → OpenAI; set ANY one of these. Leave all unset to
+      # run the fully deterministic scripted paths (the lab works without them).
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      # Allow the deployed frontend origin (localhost is always allowed).
+      - key: CORS_ORIGINS
+        fromService:
+          type: web
+          name: sviam-lab-frontend
+          envVarKey: RENDER_EXTERNAL_URL
+
+  # ── Next.js frontend ───────────────────────────────────────────────────────
+  - type: web
+    name: sviam-lab-frontend
+    runtime: node
+    plan: free
+    numInstances: 1
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 22.12.0
+      # Baked into the client bundle at BUILD time — a change requires a
+      # redeploy of this service, not just an env edit.
+      - key: NEXT_PUBLIC_API_URL
+        fromService:
+          type: web
+          name: sviam-lab-backend
+          envVarKey: RENDER_EXTERNAL_URL
+      # Maya's voice, in fallback order: ElevenLabs (paid plan) → Deepgram
+      # Aura-2 (free credits) → browser TTS. Keys are server-side only.
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: DEEPGRAM_API_KEY
+        sync: false

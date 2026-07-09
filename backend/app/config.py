@@ -11,7 +11,11 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # LLM (optional — without a key the lab uses deterministic scripted lines).
+    # Provider order at call time: OpenRouter → Groq → Gemini → OpenAI.
+    # Multiple keys = automatic per-request failover (rate-limit resilience).
     openrouter_api_key: str = ""
+    groq_api_key: str = ""
+    gemini_api_key: str = ""
     openai_api_key: str = ""
 
     # Supabase (optional — the lab defaults to an in-memory store, VNEXT_STORE=memory).

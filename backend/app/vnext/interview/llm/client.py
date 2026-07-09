@@ -27,10 +27,44 @@ import httpx
 from app.config import settings
 
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+_GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+# Google's OpenAI-compatible surface — same request/response shape as the rest.
+_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 _OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 
 _DEFAULT_OPENROUTER_MODEL = "openai/gpt-4o-mini"
+_DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+# 2.0-flash has the most generous free-tier quotas of the current Gemini line.
+_DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
 _DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+
+
+def _clean(key: str) -> str:
+    """Strip whitespace from keys. A trailing newline in a Render env var once
+    produced 'Illegal header value b\"Bearer …\\n\"' and silently disabled the
+    Voice_Assist judge — never trust a pasted key's whitespace."""
+    return (key or "").strip()
+
+
+# Split-brain routing (the Voice_Assist interviewer/judge lesson): different
+# call sites have different needs, so each role PREFERS a provider — the rest
+# of the chain stays as fallback. Interviewer turns are latency-critical on
+# every exchange → Groq (fast inference). Scorecard/rubric/JD run once per
+# session and aren't latency-bound → Gemini, which also spreads quota so a
+# long interview can't burn one provider's daily cap alone.
+# Override per deployment with LLM_PREFER_<ROLE>=<provider> (e.g.
+# LLM_PREFER_INTERVIEWER=openrouter).
+_DEFAULT_ROLE_PREFERENCE = {
+    "interviewer": "groq",
+    "scorecard": "gemini",
+    "rubric": "gemini",
+    "jd": "gemini",
+}
+
+
+def _preferred_provider(role: str) -> str:
+    env = os.getenv(f"LLM_PREFER_{(role or '').upper()}", "").strip().lower()
+    return env or _DEFAULT_ROLE_PREFERENCE.get(role, "")
 
 
 class LLMError(Exception):
@@ -49,13 +83,21 @@ def openrouter_model() -> str:
     return os.getenv("OPENROUTER_MODEL", _DEFAULT_OPENROUTER_MODEL)
 
 
+def groq_model() -> str:
+    return os.getenv("GROQ_MODEL", _DEFAULT_GROQ_MODEL)
+
+
+def gemini_model() -> str:
+    return os.getenv("GEMINI_MODEL", _DEFAULT_GEMINI_MODEL)
+
+
 def openai_model() -> str:
     return os.getenv("OPENAI_MODEL", _DEFAULT_OPENAI_MODEL)
 
 
 def _openrouter_headers() -> dict:
     headers = {
-        "Authorization": f"Bearer {settings.openrouter_api_key}",
+        "Authorization": f"Bearer {_clean(settings.openrouter_api_key)}",
         "Content-Type": "application/json",
     }
     referer = os.getenv("OPENROUTER_HTTP_REFERER")
@@ -94,7 +136,7 @@ async def call_llm(
     timeout: float = 30.0,
     max_tokens: int = 1024,
 ) -> str:
-    """Try OpenRouter, then OpenAI. Return raw assistant content text.
+    """Try OpenRouter, then Groq, then OpenAI. Return raw assistant content.
 
     ``role`` is an opaque tag for logging/telemetry only. ``model`` overrides the
     default for whichever provider is used (caller rarely needs it).
@@ -104,17 +146,45 @@ async def call_llm(
     msgs = _messages_with_system(messages)
     attempts: list[tuple[str, str, dict, str]] = []
 
-    if settings.openrouter_api_key:
+    if _clean(settings.openrouter_api_key):
         attempts.append(
             ("openrouter", _OPENROUTER_URL, _openrouter_headers(), model or openrouter_model())
         )
-    if settings.openai_api_key:
+    if _clean(settings.groq_api_key):
+        # Groq speaks the OpenAI chat/completions schema at its own base URL.
+        attempts.append(
+            (
+                "groq",
+                _GROQ_URL,
+                {
+                    "Authorization": f"Bearer {_clean(settings.groq_api_key)}",
+                    "Content-Type": "application/json",
+                },
+                model or groq_model(),
+            )
+        )
+    if _clean(settings.gemini_api_key):
+        # Gemini via Google's OpenAI-compatible endpoint. Sits after Groq so a
+        # Groq free-tier 429 fails over here automatically mid-interview (the
+        # Voice_Assist lesson: both free tiers have limits — never depend on one).
+        attempts.append(
+            (
+                "gemini",
+                _GEMINI_URL,
+                {
+                    "Authorization": f"Bearer {_clean(settings.gemini_api_key)}",
+                    "Content-Type": "application/json",
+                },
+                model or gemini_model(),
+            )
+        )
+    if _clean(settings.openai_api_key):
         attempts.append(
             (
                 "openai",
                 _OPENAI_URL,
                 {
-                    "Authorization": f"Bearer {settings.openai_api_key}",
+                    "Authorization": f"Bearer {_clean(settings.openai_api_key)}",
                     "Content-Type": "application/json",
                 },
                 model or openai_model(),
@@ -123,6 +193,12 @@ async def call_llm(
 
     if not attempts:
         raise LLMUnavailable("no_provider_configured")
+
+    # Stable reorder: the role's preferred provider (if configured) goes first;
+    # everything else keeps its place as the failover chain.
+    pref = _preferred_provider(role)
+    if pref:
+        attempts.sort(key=lambda a: a[0] != pref)
 
     errors: list[str] = []
     for name, url, headers, mdl in attempts:

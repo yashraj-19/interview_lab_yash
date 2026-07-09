@@ -49,6 +49,10 @@ def test_openrouter_tried_first(monkeypatch):
 def test_falls_back_to_openai_when_openrouter_errors(monkeypatch):
     monkeypatch.setattr(settings, "openrouter_api_key", "or-key", raising=False)
     monkeypatch.setattr(settings, "openai_api_key", "oai-key", raising=False)
+    # Isolate from real keys in a developer's .env: with groq/gemini configured
+    # they would (correctly) slot in between openrouter and openai.
+    monkeypatch.setattr(settings, "groq_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "gemini_api_key", "", raising=False)
     calls = []
 
     async def fake_chat(url, headers, body, timeout):
