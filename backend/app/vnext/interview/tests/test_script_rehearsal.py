@@ -61,6 +61,14 @@ def _interviewer_llm(captured: list[str] | None = None, leak: bool = False, slow
                 if leak
                 else "Walk the race with me: where exactly do two retries collide?"
             )
+            # The reactive conversation prompt asks for a {reply, intent, advance}
+            # shape; the phase-advance prompt asks for {utterance}. Answer each.
+            if "CONVERSATION" in text or '"reply"' in text:
+                return json.dumps({
+                    "intent": "incorrect" if leak else "partial",
+                    "reply": line, "advance": False, "covered": [],
+                    "note": "planted wrong answer",
+                })
             return json.dumps({"utterance": line})
         return json.dumps({"criteria": [
             {"id": "idempotency_fix", "name": "Idempotency fix", "description": "d",
@@ -102,29 +110,27 @@ def test_barge_in_moment_hold_on_yields_the_floor(client, monkeypatch):
         started = ws.receive_json()
         turn_id = started["turnId"]
 
-        # Maya is still generating — the candidate cuts in. "hold" is an
-        # utterance-initial interrupt word: urgency fires no matter the intent.
+        # Maya is still generating — the candidate cuts in. "hold on" is an
+        # utterance-initial interrupt: urgency fires (barge_in.detected) and it
+        # routes to a 'take your time' yield — Maya audibly hands over the floor.
         ws.send_json({"type": "barge_in", "turnId": turn_id})
         assert ws.receive_json()["type"] == "interviewer.cancelled"
         ws.send_json({"type": "candidate.text",
                       "text": "Hold on, let me answer that part first."})
-        # barge_in.detected + candidate.utterance + intent(thinking) + the
-        # thinking acknowledgment ("take your time") — Maya yields audibly.
         frames = [ws.receive_json() for _ in range(4)]
         types = [f["type"] for f in frames]
         assert "barge_in.detected" in types  # urgency preserved for content cut-ins
         acks = [f for f in frames if f["type"] == "interviewer.utterance"]
-        assert acks and acks[0].get("hint_for") == "thinking"
+        assert acks and any(w in acks[0]["text"].lower() for w in ("time", "rush", "listening"))
 
+        # The candidate's real point now drives a REACTIVE turn (no forced
+        # advance) — and reaches the conversation prompt.
         ws.send_json({"type": "candidate.text",
                       "text": "The core issue is the external provider call is not safely tied to our database write."})
         assert ws.receive_json()["type"] == "candidate.utterance"
-
-        ws.send_json({"type": "advance.request", "signal": "intro.done"})
-        ws.receive_json()  # phase.changed
-        ws.receive_json()  # turn.started
-        utter = ws.receive_json()
-        assert utter["type"] == "interviewer.utterance"
+        ws.receive_json()  # conversation.intent.detected
+        reply = ws.receive_json()
+        assert reply["type"] == "interviewer.utterance"
 
     # The cancelled turn never reached the ledger; the continuation reached the prompt.
     ledger = client.get(f"/vnext/interview/sessions/{sid}/ledger").json()["events"]
@@ -141,14 +147,19 @@ def test_wrong_answer_moment_pushback_without_verdict(client, monkeypatch):
     with client.websocket_connect(f"/vnext/interview/ws/{sid}") as ws:
         ws.send_json(_hello(sid))
         ws.receive_json(); ws.receive_json()
+        # Start the interview so we're in an active phase.
+        ws.send_json({"type": "advance.request", "signal": "session.start"})
+        ws.receive_json(); ws.receive_json(); ws.receive_json()  # phase.changed, turn.started, opening
+
+        # The planted wrong answer drives a REACTIVE turn: the model tries to
+        # open "That's wrong", and the guard must strip the verdict.
         ws.send_json({"type": "candidate.text", "text": "Maybe we can just increase the timeout."})
         assert ws.receive_json()["type"] == "candidate.utterance"
-
-        ws.send_json({"type": "advance.request", "signal": "session.start"})
-        ws.receive_json(); ws.receive_json()
+        ws.receive_json()  # conversation.intent.detected
         utter = ws.receive_json()
 
     low = utter["text"].lower()
+    assert utter["type"] == "interviewer.utterance"
     assert "wrong" not in low and "that's right" not in low
     assert "collide" in low                  # the substantive probe survived
     assert utter.get("guarded") is True      # and the leak is auditable

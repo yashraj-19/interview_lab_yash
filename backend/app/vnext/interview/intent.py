@@ -73,8 +73,14 @@ class RuleBasedIntentClassifier:
             r"^\s*(?:wait|stop|hold|hang|sorry|actually|no|hey|pause|excuse)\b",
             re.IGNORECASE,
         )
-        self._repeat_rx = re.compile(r"\b(repeat|again|rephrase|say that again|can you repeat)\b", re.IGNORECASE)
-        self._help_rx = re.compile(r"\b(stuck|guide me|hint|confused|lost|don't get it|dont get it|need help|not sure)\b", re.IGNORECASE)
+        # Repeat must be an explicit request — a bare "again" matches ordinary
+        # answers ("a retry could charge AGAIN") and misroutes them to the
+        # repeat path (observed live), so only repeat-shaped phrases count.
+        self._repeat_rx = re.compile(
+            r"\b(repeat|rephrase|say (that|it) again|once more|come again|one more time)\b",
+            re.IGNORECASE,
+        )
+        self._help_rx = re.compile(r"\b(stuck|guide me|hint|confused|lost|don't get it|dont get it|need help|not sure|help me|can you help|help with|give me a hand)\b", re.IGNORECASE)
         self._thinking_rx = re.compile(r"\b(let me think|give me a sec|give me a second|give me some time|hold on|one moment|thinking|think)\b", re.IGNORECASE)
         self._meta_audio_rx = re.compile(r"\b(hear me|can you hear me|didn't get you|didnt get you|hello|hi|hey)\b", re.IGNORECASE)
 

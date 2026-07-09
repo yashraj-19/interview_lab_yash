@@ -97,6 +97,10 @@ export interface TransportOptions {
   maxDelayMs?: number; // default 10000
   /** How long to wait for `resume_ready` after the socket opens. default 10s. */
   handshakeTimeoutMs?: number;
+  /** Keepalive ping interval once connected (ms). Proxies kill idle sockets
+   *  after a few quiet minutes; < 30s stays inside common idle windows.
+   *  0 disables (tests). default 25s. */
+  keepaliveMs?: number;
   /** Close codes that must NOT trigger a reconnect (auth/policy/in-use). */
   nonRetryableCloseCodes?: number[];
   /** resume_rejected reasons that are recoverable; everything else is terminal. */
@@ -139,6 +143,7 @@ export class InterviewTransport {
   private attempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
+  private pingTimer: ReturnType<typeof setInterval> | null = null;
   /** True once `resume_ready` arrived for the CURRENT socket. */
   private confirmed = false;
   /** Set when the consumer deliberately tears down — suppresses reconnects. */
@@ -314,6 +319,7 @@ export class InterviewTransport {
       this.clearHandshakeTimer();
       this.setState("connected");
       this.log("resume_ready", {});
+      this.startKeepalive();
       this.opts.onResumeReady?.(msg as Record<string, unknown>);
       return;
     }
@@ -385,8 +391,31 @@ export class InterviewTransport {
     return Math.round(half + this.opts.random() * half);
   }
 
+  /** Keep the socket warm across long silent thinking pauses: reverse proxies
+   * (Render included) kill idle WebSockets after a few quiet minutes, which
+   * would force a mid-interview reconnect for no reason. The server ignores
+   * unknown frame types by design, and `ping` is explicitly excluded from its
+   * candidate-activity tracking so keepalives never suppress the silence
+   * nudges. Interval < 30s stays inside common proxy idle windows. */
+  private startKeepalive(): void {
+    this.stopKeepalive();
+    const every = this.opts.keepaliveMs ?? 25_000;
+    if (every <= 0) return; // disabled (tests)
+    this.pingTimer = setInterval(() => {
+      this.send({ type: "ping" });
+    }, every);
+  }
+
+  private stopKeepalive(): void {
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+  }
+
   private closeSocket(): void {
     this.clearHandshakeTimer();
+    this.stopKeepalive();
     const ws = this.ws;
     this.ws = null;
     if (!ws) return;

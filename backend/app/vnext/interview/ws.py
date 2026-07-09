@@ -35,6 +35,7 @@ from app.services.interview_resume import (
 )
 
 from .scenario import get_scenario
+from . import conversation
 from .llm import build_scorecard_llm, build_scripted_scorecard, generate_interviewer_turn
 from .phase_controller import PhaseController, TransitionContext
 from .seed import (
@@ -574,6 +575,22 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
         if ev is not None and turn_id not in cancelled_turns:
             await send(ev)
 
+    async def run_conversation_turn(text: str, turn_id: str) -> None:
+        """Reactive candidate-turn (llm mode): the Conversation Manager listens,
+        responds in-phase, and advances only when the topic is complete. Runs as
+        a cancellable task so a barge-in kills it mid-generation with nothing
+        emitted (the LLM call is awaited BEFORE any event is minted)."""
+        try:
+            events = await conversation.substantive_turn(session_id, text)
+        except asyncio.CancelledError:
+            return
+        finally:
+            active_turns.pop(turn_id, None)
+        if turn_id in cancelled_turns:
+            return
+        for ev in events:
+            await send(ev)
+
     async def _silence_watchdog() -> None:
         """Joint-silence ladder: neutral think-aloud nudge, then one check-in.
 
@@ -645,6 +662,13 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
             if not isinstance(msg, dict):
                 continue
             mtype = msg.get("type")
+
+            # Transport keepalive: keeps the socket warm through proxies that
+            # kill idle WebSockets. Deliberately NOT candidate activity — a
+            # 25s ping heartbeat would otherwise permanently suppress the
+            # silence nudges (whose first threshold is ~25s).
+            if mtype == "ping":
+                continue
 
             # Any client-origin message is candidate activity: the silence
             # ladder resets and a fresh episode begins.
@@ -777,7 +801,34 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
                     await send(_emit(session_id, "system", "barge_in.detected",
                                    {"intent": intent, "text": text_str}))
 
-                # Pass force_immediate flag if this was an urgent interrupt.
+                sess = STORE.get_session(session_id)
+                if sess and sess.get("mode") == "llm":
+                    # ── ADAPTIVE CONVERSATION (llm mode) ──────────────────────
+                    # The Conversation Manager decides Maya's reaction and whether
+                    # the phase is complete — the frontend no longer forces an
+                    # advance per utterance. Conversational intents are handled
+                    # instantly and deterministically; a real answer gets a
+                    # cancellable reactive turn.
+                    category = conversation.route(text_str, session_id)
+                    substantive = category == "substantive"
+                    cand_seq = STORE.get_ledger(session_id).last_seq + 1
+                    cand_payload = {"lineId": f"cand-{cand_seq}", "text": text_str}
+                    if not substantive:
+                        # Fillers/help/repeat don't count toward the phase turn floor.
+                        cand_payload["nonSubstantive"] = True
+                    await send(_emit(session_id, "candidate", "candidate.utterance", cand_payload))
+
+                    if substantive:
+                        turn_id = f"conv-{cand_seq}"
+                        active_turns[turn_id] = asyncio.create_task(
+                            run_conversation_turn(text_str, turn_id)
+                        )
+                    else:
+                        for ev in conversation.deterministic_turn(session_id, category, text_str):
+                            await send(ev)
+                    continue
+
+                # ── SCRIPTED mode: deterministic director (unchanged) ─────────
                 for ev in _handle_candidate_text(session_id, text_str, force_immediate=cancelled_any, intent=intent):
                     # scheduled interviewer markers are dicts with key 'scheduled_interviewer'
                     if isinstance(ev, dict) and ev.get("scheduled_interviewer"):

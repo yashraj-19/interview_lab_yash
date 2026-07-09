@@ -95,10 +95,14 @@ class TestIntentClassification:
             assert classifier.classify(phrase) == "help", f"'{phrase}' should be help"
 
     def test_repeat_intent(self, classifier):
-        """Repeat: candidate asking for clarification."""
-        repeat_phrases = ["repeat", "again", "rephrase", "say that again", "can you repeat"]
+        """Repeat: explicit repeat-shaped requests only."""
+        repeat_phrases = ["repeat", "rephrase", "say that again", "can you repeat",
+                          "once more", "one more time please"]
         for phrase in repeat_phrases:
             assert classifier.classify(phrase) == "repeat", f"'{phrase}' should be repeat"
+        # A bare "again" inside an ANSWER must not misroute to repeat (observed
+        # live: "a retry could charge again" was restated instead of probed).
+        assert classifier.classify("a retry could charge again") == "answer"
 
     def test_thinking_intent(self, classifier):
         """Thinking: candidate needs time."""

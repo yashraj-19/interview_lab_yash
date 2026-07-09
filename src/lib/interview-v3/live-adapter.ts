@@ -41,6 +41,7 @@ import type {
 import { SCRIPTED_SESSION, type ScriptEvent } from "./seed/interviewer-script";
 import {
   InterviewTransport,
+  type ConnectionState,
   type WebSocketLike,
 } from "@/lib/interview-transport";
 import { API_URL } from "@/lib/api-url";
@@ -76,6 +77,9 @@ export interface LiveAdapterOptions {
   scorecardTimeoutMs?: number;
   /** Optional lab-only interview track (e.g. "incident-demo") sent on create. */
   track?: string;
+  /** Truthful connection-state stream for the UI (connected / reconnecting /
+   *  failed, plus the attempt counter). Optional — defaults to silent. */
+  onConnectionState?: (state: ConnectionState, attempts: number) => void;
 }
 
 /** Default bound for awaiting scorecard.completed (ms). Matches the backend's
@@ -141,6 +145,8 @@ export class LiveInterviewAdapter implements InterviewAdapter {
   /** One-shot waiters keyed on a predicate over freshly-applied events. */
   private waiters: { predicate: (e: VNextEvent) => boolean; resolve: (e: VNextEvent) => void }[] = [];
 
+  private readonly onConnectionState?: (state: ConnectionState, attempts: number) => void;
+
   constructor(opts: LiveAdapterOptions) {
     this.sessionId = opts.sessionId;
     this.apiBase = (opts.apiBase ?? defaultApiBase()).replace(/\/$/, "");
@@ -150,6 +156,7 @@ export class LiveInterviewAdapter implements InterviewAdapter {
     this.backendMode = opts.backendMode ?? "scripted";
     this.fakeLlm = opts.fakeLlm ?? false;
     this.track = opts.track;
+    this.onConnectionState = opts.onConnectionState;
     this.scorecardTimeoutMs = opts.scorecardTimeoutMs ?? DEFAULT_SCORECARD_TIMEOUT_MS;
     this.connId =
       opts.randomUUID?.() ??
@@ -237,7 +244,10 @@ export class LiveInterviewAdapter implements InterviewAdapter {
           client_conn_id: this.connId,
         }),
         onMessage: (data) => this.handleMessage(data),
-        onState: () => {},
+        // Surface truthful connection state (reconnecting/failed + attempts)
+        // so the room can show it instead of a stale "Connected" dot.
+        onState: (state) => this.onConnectionState?.(state, transport.getAttempts()),
+        onAttempt: (n) => this.onConnectionState?.(transport.getState(), n),
         onResumeReady: () => {
           this.flushOutbox();
           resolve();

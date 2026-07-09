@@ -122,6 +122,10 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
   const [isIncident, setIsIncident] = useState(false);
   // Scenario task card text vended by the backend (single source of truth).
   const [scenarioTask, setScenarioTask] = useState<string | null>(null);
+  // Truthful WS connection state (live modes): the transport reports
+  // reconnects/failures so the header dot never shows a stale "Connected".
+  const [connState, setConnState] = useState<string>("connected");
+  const [connAttempts, setConnAttempts] = useState(0);
   const [code, setCode] = useState("");
   const [theme, setTheme] = useState<"dark" | "light">("dark");
 
@@ -293,7 +297,22 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
 
   // Speak each NEW interviewer turn exactly once (mute honored inside speak()).
   // If the candidate barged in, the turn lands in the ledger but is NOT spoken.
+  //
+  // VOICE/TEXT SYNC: the ledger event arrives seconds before the TTS audio
+  // does (synth round-trip), and reading Maya's line before hearing it breaks
+  // the live feel. So the newest line is HIDDEN from the transcript until her
+  // audio actually starts (speak()'s onStart), with a failsafe reveal so text
+  // can never be lost if playback fails or is muted mid-flight.
   const spokenSeqRef = useRef(-1);
+  const [hiddenSpeakSeq, setHiddenSpeakSeq] = useState<number | null>(null);
+  const revealTimerRef = useRef<number | null>(null);
+  const revealNow = () => {
+    if (revealTimerRef.current) {
+      window.clearTimeout(revealTimerRef.current);
+      revealTimerRef.current = null;
+    }
+    setHiddenSpeakSeq(null);
+  };
   useEffect(() => {
     const src = isLlm ? llmLedger : [...revealed, ...liveExtra];
     // Turns the server cancelled (barge-in) must never auto-speak, even on the
@@ -317,8 +336,22 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
       return;
     }
     speakingMayaTextRef.current = latest.text;
-    ttsRef.current.speak(latest.text);
+    if (tts.supported && !tts.muted) {
+      const seq = latest.seq;
+      setHiddenSpeakSeq(seq);
+      if (revealTimerRef.current) window.clearTimeout(revealTimerRef.current);
+      // Failsafe: never keep text hidden longer than the synth could plausibly
+      // take — if audio hasn't started by then, show the words anyway.
+      revealTimerRef.current = window.setTimeout(() => {
+        revealTimerRef.current = null;
+        setHiddenSpeakSeq((cur) => (cur === seq ? null : cur));
+      }, 3500);
+      ttsRef.current.speak(latest.text, revealNow);
+    } else {
+      ttsRef.current.speak(latest.text);
+    }
     dispatchBarge("interviewer_start");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLlm, llmLedger, revealed, liveExtra]);
 
   // ── latency masking ────────────────────────────────────────────────────────
@@ -422,7 +455,17 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
         }
       }
 
-      adapter = makeAdapter({ mode: handoffMode, sessionId, fakeLlm: handoff.fakeLlm, track: handoff.track });
+      adapter = makeAdapter({
+        mode: handoffMode,
+        sessionId,
+        fakeLlm: handoff.fakeLlm,
+        track: handoff.track,
+        onConnectionState: (state, attempts) => {
+          if (cancelled) return;
+          setConnState(state);
+          setConnAttempts(attempts);
+        },
+      });
       await adapter.generateRubric(handoff.intake);
       // StrictMode double-mount guard: if this run was already torn down while
       // generateRubric was in flight, never publish this (now-stopped) adapter
@@ -545,13 +588,21 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
   function handleSendAnswer(currentPhase: Phase, explicit?: string) {
     const text = (explicit ?? answer).trim();
     if (!text) return;
+    // Just send what the candidate said. The BACKEND Conversation Manager now
+    // decides Maya's reaction and whether the topic is complete — it no longer
+    // advances a phase on every utterance (that made the interview feel like a
+    // scripted quiz that ignored the candidate). In scripted/mock mode the
+    // legacy per-answer advance still applies below.
     adapterRef.current?.sendCandidateText(text);
     setAnswer("");
     dispatchBarge("sent"); // floor returns to the interviewer for the next turn
-    // One natural action: after recording the answer, ask the interviewer to
-    // respond (advance to the next turn). The server PhaseController validates
-    // the transition; the LLM never sets the phase. If the phase is terminal
-    // (no next signal) we just record the answer.
+    if (isLlm) {
+      // Backend-driven conversation: no client advance. Show a brief "thinking".
+      setBusyAdvance(true);
+      window.setTimeout(() => setBusyAdvance(false), 600);
+      return;
+    }
+    // Scripted/mock: keep the deterministic one-answer-one-turn playback.
     const signal = nextSignalForPhase(currentPhase);
     if (!signal) return;
     setBusyAdvance(true);
@@ -642,7 +693,9 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
   }
 
   const ledger = isLlm ? [...llmLedger] : [...revealed, ...liveExtra];
-  const transcript = selectTranscript(ledger);
+  // Voice/text sync: the newest interviewer line stays out of the visible
+  // transcript until her audio starts (or the failsafe reveals it).
+  const transcript = selectTranscript(ledger).filter((t) => t.seq !== hiddenSpeakSeq);
   const codeState = selectCode(ledger);
   const runs = selectRuns(ledger);
   const phase: Phase = selectCurrentPhase(ledger, "ready");
@@ -783,7 +836,20 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
             <div className="flex items-center gap-3 text-[11px] text-[var(--rp-ink2)]">
               <DarkDot ok={voiceOk} label={voiceLabel} />
               <DarkDot ok={stt.supported} label={stt.supported ? "Mic" : "No mic"} />
-              <DarkDot ok={ready} label={ready ? "Connected" : "Connecting"} />
+              <DarkDot
+                ok={ready && connState === "connected"}
+                label={
+                  !ready
+                    ? "Connecting"
+                    : connState === "connected"
+                      ? "Connected"
+                      : connState === "reconnecting"
+                        ? `Reconnecting${connAttempts > 1 ? ` (${connAttempts})` : "…"}`
+                        : connState === "failed"
+                          ? "Offline"
+                          : "Connecting"
+                }
+              />
               {tts.supported ? (
                 <>
                   <button className="hover:text-[var(--rp-ink)]" onClick={tts.toggleMute}>

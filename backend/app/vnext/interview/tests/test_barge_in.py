@@ -112,21 +112,16 @@ def test_next_turn_after_barge_in_sees_candidate_answer(client, monkeypatch):
         ws.send_json({"type": "barge_in", "turnId": first_turn})
         assert ws.receive_json()["type"] == "interviewer.cancelled"
 
-        # Candidate answers, then advances → a NEW turn is generated.
+        # The candidate's answer now drives a REACTIVE conversation turn directly
+        # (no forced advance) — and that turn's prompt is built from a transcript
+        # that includes the answer.
         ws.send_json({"type": "candidate.text", "text": "I used a unique idempotency key per charge."})
         assert ws.receive_json()["type"] == "candidate.utterance"
-
-        ws.send_json({"type": "advance.request", "signal": "intro.done"})
-        ws.receive_json()  # phase.changed (intro→resume_calibration)
-        started2 = ws.receive_json()
-        assert started2["type"] == "interviewer.turn.started"
-        second_turn = started2["turnId"]
-        assert second_turn != first_turn
-        utter = ws.receive_json()  # the (non-cancelled) interviewer utterance
+        ws.receive_json()  # conversation.intent.detected
+        utter = ws.receive_json()  # the reactive interviewer reply
         assert utter["type"] == "interviewer.utterance"
-        assert utter["turnId"] == second_turn
 
-    # The next turn's prompt was built from a transcript that included the answer.
+    # The reactive turn's prompt was built from a transcript that included the answer.
     assert any("idempotency key per charge" in body for body in captured)
 
 

@@ -41,6 +41,7 @@ export function makeAdapter(opts: MakeAdapterOptions): InterviewAdapter {
       backendMode: opts.mode === "live-llm" ? "llm" : "scripted",
       fakeLlm: opts.mode === "live-llm" ? opts.fakeLlm : false,
       track: opts.mode === "live-llm" ? opts.track : undefined,
+      onConnectionState: opts.onConnectionState,
     });
   }
   return new MockInterviewAdapter({

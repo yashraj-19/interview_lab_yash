@@ -181,7 +181,11 @@ export interface TextToSpeech {
   /** The engine that voiced the most recent turn (honest readiness signal). */
   engine: TtsEngine;
   toggleMute: () => void;
-  speak: (text: string) => void;
+  /** Speak a line. `onStart` fires the moment AUDIO actually begins (primary,
+   *  cached, or fallback engine) — lets the UI reveal the transcript line in
+   *  sync with the voice instead of seconds before it. Not called when muted
+   *  or when playback never starts (callers should use a failsafe timeout). */
+  speak: (text: string, onStart?: () => void) => void;
   replay: () => void;
   cancel: () => void;
   /** Pre-fetch and cache the audio for short lines (latency-masking fillers)
@@ -267,7 +271,7 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
   }, [stopBrowserTts]);
 
   const fallbackSpeak = useCallback(
-    (text: string, gen: number) => {
+    (text: string, gen: number, onStart?: () => void) => {
       const synth = win?.speechSynthesis;
       const Utterance = win?.SpeechSynthesisUtterance;
       if (!synth || !Utterance) {
@@ -283,6 +287,9 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
         u.volume = FALLBACK_VOICE_SETTINGS.volume;
         const preferred = pickPreferredVoice(synth.getVoices());
         if (preferred) u.voice = preferred;
+        u.onstart = () => {
+          if (gen === genRef.current) onStart?.();
+        };
         u.onend = () => {
           if (gen === genRef.current) setSpeaking(false);
         };
@@ -298,7 +305,7 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
   );
 
   const speakText = useCallback(
-    async (text: string) => {
+    async (text: string, onStart?: () => void) => {
       // Sanitize code-ish tokens so the voice pronounces words naturally.
       const clean = sanitizeForSpeech(text);
       if (!clean || !win) return;
@@ -348,7 +355,10 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
         audio.onerror = finish;
         try {
           await audio.play();
-          if (gen === genRef.current) setEngine("sia");
+          if (gen === genRef.current) {
+            setEngine("sia");
+            onStart?.();
+          }
           return;
         } catch {
           if (gen !== genRef.current) return; // canceled mid-play
@@ -380,7 +390,10 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
             audio.onended = finish;
             audio.onerror = finish;
             await audio.play();
-            if (gen === genRef.current) setEngine("sia"); // real ElevenLabs voice
+            if (gen === genRef.current) {
+              setEngine("sia"); // real ElevenLabs voice
+              onStart?.();
+            }
             return;
           }
           // Non-OK (e.g. 503 no key) → fall through to browser TTS.
@@ -390,7 +403,7 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
       }
 
       if (gen !== genRef.current) return;
-      fallbackSpeak(clean, gen);
+      fallbackSpeak(clean, gen, onStart);
     },
     [win, endpoint, stopBrowserTts, fallbackSpeak],
   );
@@ -398,12 +411,12 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
   // Speak only if not muted; ALWAYS remember the last text so unmute + replay
   // works even for turns that arrived while muted.
   const speak = useCallback(
-    (text: string) => {
+    (text: string, onStart?: () => void) => {
       const clean = text.trim();
       if (!clean) return;
       lastTextRef.current = clean;
       if (muted) return;
-      void speakText(clean);
+      void speakText(clean, onStart);
     },
     [muted, speakText],
   );

@@ -24,6 +24,7 @@ from typing import Optional
 from ..roles import pick_persona
 from ..scenario import get_scenario
 from ..phase_controller import ADVANCE_SIGNALS
+from ..conversation_memory import ConversationMemory
 from ._parse import extract_json
 from .client import LLMUnavailable, call_llm
 
@@ -366,3 +367,158 @@ async def generate_interviewer_turn(
         suggested = None
 
     return {"text": text.strip(), "suggestedAdvance": suggested}
+
+
+# ── reactive conversation turn (the anti-lockstep response generator) ──────────
+
+# The candidate-intent categories the conversation model classifies each turn
+# into. Purely informational to the caller (drives logging/metrics); the reply
+# and advance flag are what actually move the interview.
+CONVERSATION_INTENTS = (
+    "answered", "partial", "correct", "incorrect", "confused",
+    "clarification", "off_topic", "conversational",
+)
+
+_NEXT_PHASE_OBJECTIVE = {
+    "intro": "resume_calibration: drill into what THEY personally owned on a real project.",
+    "resume_calibration": "problem_framing: pose a realistic technical scenario for this role and have them frame it.",
+    "problem_framing": "coding: get them writing actual code in the code box.",
+    "coding": "debugging: introduce a concrete failure and have them diagnose the root cause.",
+    "debugging": "optimization: push on scale, concurrency, and tradeoffs.",
+    "optimization": "wrap_up: one short question about real production experience.",
+    "wrap_up": "(the interview is ending)",
+}
+
+
+def _build_conversation_messages(
+    *,
+    phase: str,
+    intake: dict,
+    rubric: dict,
+    memory: ConversationMemory,
+    transcript: str,
+    candidate_text: str,
+    evidence_summary: str,
+    track: str | None,
+    persona: str | None,
+) -> list[dict]:
+    languages = ", ".join(intake.get("languages", []) or []) or "(unspecified)"
+    spec = get_scenario(track)
+    guidance = (
+        spec.phase_guidance.get(phase) if spec is not None else None
+    ) or PHASE_GUIDANCE.get(phase, "Probe for concrete technical depth relevant to this phase.")
+
+    system = (
+        "You are Maya, an experienced senior engineer running a LIVE technical "
+        "interview. This is a real CONVERSATION, not a questionnaire. You just "
+        "heard the candidate's latest response — react the way a thoughtful "
+        "senior interviewer actually would:\n"
+        "- Answered well: acknowledge briefly, then probe DEEPER (an edge case, a "
+        "tradeoff, a 'why', a failure mode). Never move on after a single good "
+        "answer.\n"
+        "- Partial answer: acknowledge the right part, then push on exactly what's "
+        "missing.\n"
+        "- Wrong: do NOT say 'wrong' or 'incorrect'. Ask a question that exposes "
+        "the gap ('what happens if two retries arrive at once?').\n"
+        "- Confused / 'I don't know': do NOT move on and do NOT repeat the same "
+        "question. Narrow it down ('which part — the retry logic, idempotency, or "
+        "concurrency?') and offer to reason through it together.\n"
+        "- Asks a clarifying question: answer it directly in one line, then return "
+        "to the topic.\n"
+        "- Asks you to repeat: restate the current question in FRESH words.\n"
+        "- Off-topic or chit-chat: a brief human acknowledgment, then steer back.\n"
+        "Stay on the CURRENT topic until the candidate has genuinely engaged with "
+        "it — one real answer plus at least one follow-up they responded to. Only "
+        "then set advance=true.\n"
+        "HARD RULES: never state correctness verbatim ('that's right/wrong'); "
+        "never praise ('great', 'perfect'); at most TWO short sentences; sound "
+        "human and VARY your wording — never reuse an opener or a follow-up you "
+        "already used (they are listed below); if a coding task, direct them to "
+        "the code box when appropriate but do not repeat 'type the code' every "
+        "turn.\n"
+    )
+    system += "\n" + pick_persona(persona, intake.get("seniority"))["prompt_addition"]
+    if spec is not None and spec.reveal_terms:
+        system += (
+            "\nNEVER name the target approach or say any of these terms yourself: "
+            f"{', '.join(spec.reveal_terms)} — make the candidate arrive at it."
+        )
+    system += (
+        "\nReturn STRICT JSON only: {\"intent\": one of "
+        f"[{', '.join(CONVERSATION_INTENTS)}], "
+        "\"reply\": your spoken response, \"advance\": boolean (true ONLY if the "
+        "candidate has fully satisfied this topic and you have already probed a "
+        "follow-up), \"covered\": [short topic tags the candidate addressed this "
+        "turn], \"note\": one short clause on their answer for your own memory}. "
+        "If advance is true, make your reply briefly wrap this topic and open the "
+        "next area naturally."
+    )
+
+    user = (
+        f"Current phase: {phase}\n"
+        f"This phase's objective: {guidance}\n"
+        f"If you advance, the next area is — {_NEXT_PHASE_OBJECTIVE.get(phase, '(end)')}\n"
+        f"Role: {intake.get('role', '')} ({intake.get('seniority', 'mid')}); Languages: {languages}\n\n"
+        f"YOUR MEMORY OF THIS INTERVIEW:\n{memory.as_prompt_context()}\n\n"
+        f"{evidence_summary}\n\n"
+        f"Recent conversation:\n{transcript}\n\n"
+        f"The candidate JUST said:\n\"{candidate_text}\"\n\n"
+        "React to what they actually said, per the rules above, and return the JSON."
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+async def generate_conversation_turn(
+    session_id: str,
+    *,
+    phase: str,
+    intake: dict,
+    rubric: dict,
+    memory: ConversationMemory,
+    transcript_events: list[dict],
+    candidate_text: str,
+    track: str | None = None,
+    persona: str | None = None,
+) -> Optional[dict]:
+    """Reactive interviewer turn: understand the candidate's latest utterance and
+    respond in-phase. Returns
+    ``{"reply", "intent", "advance", "covered": [...], "note"}`` or None on
+    no-provider / malformed / error (the caller then uses a deterministic
+    acknowledgment and stays in phase — never a silent drop)."""
+    transcript = _summarize_transcript(transcript_events)
+    status = compute_evidence_status(transcript_events)
+    evidence_summary = missing_evidence_summary(status)
+    try:
+        content = await call_llm(
+            _build_conversation_messages(
+                phase=phase, intake=intake, rubric=rubric, memory=memory,
+                transcript=transcript, candidate_text=candidate_text,
+                evidence_summary=evidence_summary, track=track, persona=persona,
+            ),
+            role="interviewer",
+            temperature=0.6,
+            max_tokens=320,
+        )
+    except (LLMUnavailable, Exception):
+        return None
+
+    parsed = extract_json(content)
+    if not isinstance(parsed, dict):
+        return None
+    reply = parsed.get("reply")
+    if not isinstance(reply, str) or not reply.strip():
+        return None
+    intent = parsed.get("intent")
+    if intent not in CONVERSATION_INTENTS:
+        intent = "answered"
+    covered = parsed.get("covered")
+    covered = [str(c) for c in covered][:8] if isinstance(covered, list) else []
+    note = parsed.get("note")
+    note = str(note)[:200] if isinstance(note, str) and note.strip() else ""
+    return {
+        "reply": reply.strip(),
+        "intent": intent,
+        "advance": bool(parsed.get("advance")),
+        "covered": covered,
+        "note": note,
+    }
