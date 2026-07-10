@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   appendFinal,
+  bigramSimilarity,
+  isFuzzyEcho,
   sanitizeForSpeech,
   isLikelySpeechEcho,
   buildInterviewerVoiceRequest,
@@ -251,5 +253,53 @@ describe("appendFinal", () => {
     expect(appendFinal("hello", "world")).toBe("hello world");
     expect(appendFinal("hello ", "world")).toBe("hello world");
     expect(appendFinal("hello", "   ")).toBe("hello");
+  });
+});
+
+describe("isFuzzyEcho — garble-resistant speaker-echo detection", () => {
+  const MAYA =
+    "Inspect the code in the box and identify why it sometimes creates duplicate charges on retry.";
+
+  it("catches the EXACT live garble that made Maya cancel herself", () => {
+    // Observed in production: her opening line came back from the mic as this.
+    expect(isFuzzyEcho("inspectacled in the park", [MAYA])).toBe(true);
+  });
+
+  it("catches verbatim echo and partial leading echo", () => {
+    expect(isFuzzyEcho("inspect the code in the box", [MAYA])).toBe(true);
+    expect(isFuzzyEcho("identify why it sometimes creates duplicate", [MAYA])).toBe(true);
+  });
+
+  it("does NOT flag a genuine candidate answer", () => {
+    expect(isFuzzyEcho("I would use a hash map to store the complements", [MAYA])).toBe(false);
+    expect(isFuzzyEcho("hold on, let me answer that part first", [MAYA])).toBe(false);
+    expect(isFuzzyEcho("I don't know this question", [MAYA])).toBe(false);
+  });
+
+  it("checks against multiple recent lines", () => {
+    const nudge = "Talk me through what you're thinking, half-formed is fine.";
+    expect(isFuzzyEcho("talk me through what you are thinking", [MAYA, nudge])).toBe(true);
+  });
+
+  it("short blips never match (leaves room for quick real interjections)", () => {
+    expect(isFuzzyEcho("wait", [MAYA])).toBe(false);
+    expect(isFuzzyEcho("hold on", [MAYA])).toBe(false);
+  });
+
+  it("topical answers REUSING her vocabulary (reordered) are NOT echo", () => {
+    expect(
+      isFuzzyEcho("check idempotency key to avoid duplicate charges", [MAYA]),
+    ).toBe(false);
+    expect(
+      isFuzzyEcho(
+        "we should check the idempotency key before creating a duplicate charge on retry",
+        [MAYA],
+      ),
+    ).toBe(false);
+  });
+
+  it("bigramSimilarity sanity", () => {
+    expect(bigramSimilarity("inspect the code", "inspect the code")).toBe(1);
+    expect(bigramSimilarity("abc", "xyz")).toBe(0);
   });
 });

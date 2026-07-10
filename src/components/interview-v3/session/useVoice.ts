@@ -190,6 +190,12 @@ export interface TextToSpeech {
    *  play, in order, instead of the second cancelling the first mid-synthesis.
    *  `onStart` fires when THIS line's audio begins. */
   enqueue: (text: string, onStart?: () => void) => void;
+  /** TRUE only while audio is audibly playing (not during synthesis/fetch).
+   *  The barge-in gate keys off this — Voice_Assist's rule: you can only
+   *  interrupt speech that is actually happening. Synchronous (ref-backed). */
+  isAudioPlaying: () => boolean;
+  /** Epoch ms when audio last stopped — echo tails arrive shortly AFTER. */
+  lastAudioEndedAt: () => number;
   replay: () => void;
   cancel: () => void;
   /** Pre-fetch and cache the audio for short lines (latency-masking fillers)
@@ -214,6 +220,9 @@ export interface UseTextToSpeechOptions {
   revokeObjectURL?: (url: string) => void;
   /** Lab TTS endpoint. */
   endpoint?: string;
+  /** Voice observability: every lifecycle event (enqueue/start/end/cancel/
+   *  fallback) with a short detail — feeds the on-screen voice log. */
+  onVoiceEvent?: (event: string, detail?: string) => void;
 }
 
 const DEFAULT_TTS_ENDPOINT = "/api/lab/voice";
@@ -260,16 +269,35 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
 
   // Serial speak queue (imperative + ref-based, so it never races React state):
   // interviewer lines play strictly one-at-a-time, in order. speakingRef is the
-  // SYNCHRONOUS "a line is playing" flag (state lags a render behind and caused
-  // the second of two close lines to cancel the first mid-synthesis).
+  // SYNCHRONOUS "a line is being processed" flag (state lags a render behind and
+  // caused the second of two close lines to cancel the first mid-synthesis).
   const speakingRef = useRef(false);
   const queueRef = useRef<{ text: string; onStart?: () => void }[]>([]);
+  // TRUE only while audio is AUDIBLE (play started, not ended). The barge-in
+  // gate keys off this so the candidate's own trailing sentence can never
+  // cancel a reply that hasn't started playing yet (Voice_Assist tie guard).
+  const audioPlayingRef = useRef(false);
+  const lastAudioEndedAtRef = useRef(0);
+
+  const emit = useCallback((event: string, detail?: string) => {
+    optsRef.current.onVoiceEvent?.(event, detail);
+  }, []);
+
+  const markAudioStart = useCallback(() => {
+    audioPlayingRef.current = true;
+  }, []);
+  const markAudioStop = useCallback(() => {
+    if (audioPlayingRef.current) lastAudioEndedAtRef.current = Date.now();
+    audioPlayingRef.current = false;
+  }, []);
 
   const cancel = useCallback(() => {
     // Barge-in / mute: drop the whole queue and invalidate any in-flight
     // synth/playback, then stop audio + TTS.
+    emit("cancel", `queue=${queueRef.current.length}`);
     queueRef.current = [];
     speakingRef.current = false;
+    markAudioStop();
     genRef.current += 1;
     const a = audioRef.current;
     if (a) {
@@ -282,7 +310,7 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
     }
     stopBrowserTts();
     setSpeaking(false);
-  }, [stopBrowserTts]);
+  }, [stopBrowserTts, emit, markAudioStop]);
 
   const fallbackSpeak = useCallback(
     (text: string, gen: number, onStart?: () => void, onEnd?: () => void) => {
@@ -303,14 +331,22 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
         const preferred = pickPreferredVoice(synth.getVoices());
         if (preferred) u.voice = preferred;
         u.onstart = () => {
-          if (gen === genRef.current) onStart?.();
+          if (gen === genRef.current) {
+            markAudioStart();
+            emit("audio-start", "fallback");
+            onStart?.();
+          }
         };
         u.onend = () => {
           if (gen === genRef.current) setSpeaking(false);
+          markAudioStop();
+          emit("audio-end", "fallback");
           onEnd?.();
         };
         u.onerror = () => {
           if (gen === genRef.current) setSpeaking(false);
+          markAudioStop();
+          emit("audio-end", "fallback-error");
           onEnd?.();
         };
         synth.speak(u);
@@ -319,7 +355,7 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
         onEnd?.();
       }
     },
-    [win],
+    [win, emit, markAudioStart, markAudioStop],
   );
 
   const speakText = useCallback(
@@ -379,7 +415,9 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
         audioRef.current = audio;
         const done = () => {
           if (gen === genRef.current) setSpeaking(false);
+          markAudioStop();
           revoke?.(url);
+          emit("audio-end", "cached");
           finish();
         };
         audio.onended = done;
@@ -388,6 +426,8 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
           await audio.play();
           if (gen === genRef.current) {
             setEngine("sia");
+            markAudioStart();
+            emit("audio-start", "cached");
             onStart?.();
           } else {
             done(); // superseded during the play() promise
@@ -427,14 +467,18 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
             audioRef.current = audio;
             const done = () => {
               if (gen === genRef.current) setSpeaking(false);
+              markAudioStop();
               revoke?.(url);
+              emit("audio-end", "remote");
               finish();
             };
             audio.onended = done;
             audio.onerror = done;
             await audio.play();
             if (gen === genRef.current) {
-              setEngine("sia"); // real ElevenLabs voice
+              setEngine("sia"); // real ElevenLabs/Deepgram voice
+              markAudioStart();
+              emit("audio-start", "remote");
               onStart?.();
             } else {
               done();
@@ -491,10 +535,11 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
       if (!clean) return;
       lastTextRef.current = clean;
       if (muted) return;
+      emit("enqueue", clean.slice(0, 48));
       queueRef.current.push({ text: clean, onStart });
       pump();
     },
-    [muted, pump],
+    [muted, pump, emit],
   );
 
   const replay = useCallback(() => {
@@ -541,5 +586,8 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
   // Cancel speech on unmount.
   useEffect(() => () => cancel(), [cancel]);
 
-  return { supported, muted, speaking, engine, toggleMute, speak, enqueue, replay, cancel, prime };
+  const isAudioPlaying = useCallback(() => audioPlayingRef.current, []);
+  const lastAudioEndedAt = useCallback(() => lastAudioEndedAtRef.current, []);
+  return { supported, muted, speaking, engine, toggleMute, speak, enqueue,
+           isAudioPlaying, lastAudioEndedAt, replay, cancel, prime };
 }

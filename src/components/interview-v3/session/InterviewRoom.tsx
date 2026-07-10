@@ -26,11 +26,12 @@ import {
 } from "@/lib/interview-v3";
 import {
   appendFinal,
+  isFuzzyEcho,
   isLikelySpeechEcho,
   nextBargeState,
   type BargeState,
 } from "@/lib/interview-v3/voice";
-import { decideBargeIn, decideTurnEnd } from "@/lib/interview-v3/turn-taking";
+import { decideBargeIn, decideTurnEnd, isCutIn } from "@/lib/interview-v3/turn-taking";
 import {
   INCIDENT_SEED_CODE,
   INCIDENT_TASK_PROMPT,
@@ -147,7 +148,19 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
   const voiceAutoRef = useRef(false);
   const sendTimerRef = useRef<number | null>(null);
   const speakingMayaTextRef = useRef("");
-  const tts = useTextToSpeech();
+  // Last few spoken lines — the fuzzy echo check compares against ALL of them
+  // (speaker echo often surfaces garbled and slightly late).
+  const recentMayaLinesRef = useRef<string[]>([]);
+  // Voice observability: every voice lifecycle event, on screen + console —
+  // "see the actual logs" when a line misbehaves in a live run.
+  const [voiceLog, setVoiceLog] = useState<string[]>([]);
+  const logVoice = (event: string, detail?: string) => {
+    const line = `${new Date().toISOString().slice(11, 23)} ${event}${detail ? ` · ${detail}` : ""}`;
+    // eslint-disable-next-line no-console
+    console.info(`[voice] ${line}`);
+    setVoiceLog((l) => [...l.slice(-39), line]);
+  };
+  const tts = useTextToSpeech({ onVoiceEvent: logVoice });
   const ttsRef = useRef(tts);
   // Keep "latest value" refs current without mutating during render.
   useEffect(() => {
@@ -217,8 +230,21 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
         }
       }
     },
-    shouldIgnoreResult: (text) =>
-      ttsRef.current.speaking && isLikelySpeechEcho(text, speakingMayaTextRef.current),
+    shouldIgnoreResult: (text) => {
+      // Echo shield: while Maya's audio is playing — or within its 1.5s tail —
+      // drop anything that RESEMBLES her recent lines, garbled or not (live
+      // sample: "Inspect the code in the box" heard as "inspectacled in the
+      // park" — exact-token matching missed it and she cancelled herself).
+      const nearAudio =
+        ttsRef.current.isAudioPlaying() ||
+        Date.now() - ttsRef.current.lastAudioEndedAt() < 1500;
+      if (!nearAudio) return false;
+      const echo =
+        isFuzzyEcho(text, recentMayaLinesRef.current) ||
+        isLikelySpeechEcho(text, speakingMayaTextRef.current);
+      if (echo) logVoice("echo-dropped", text.slice(0, 48));
+      return echo;
+    },
     // Every passing recognition result: manage the auto-send timer and run the
     // barge-in gate. (onSpeechStart is one-shot per recognizer instance, so the
     // per-result stream is what keeps barge-in working all session long.)
@@ -237,10 +263,25 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
         lastSpeakingPingRef.current = now;
         adapterRef.current?.notifySpeaking?.();
       }
-      if (ttsRef.current.speaking) {
+      if (ttsRef.current.isAudioPlaying()) {
+        // Maya is AUDIBLY speaking: the barge gate applies (backchannel
+        // immunity, cut-in words, ≥3 substantive words / sustained speech).
         if (speechOnsetRef.current === null) speechOnsetRef.current = Date.now();
         const sustainedMs = Date.now() - speechOnsetRef.current;
-        if (decideBargeIn(heard, sustainedMs) === "interrupt") executeBargeIn();
+        if (decideBargeIn(heard, sustainedMs) === "interrupt") {
+          logVoice("barge-in", heard.slice(0, 48));
+          executeBargeIn();
+        }
+      } else if (ttsRef.current.speaking) {
+        // Her reply is still SYNTHESIZING (nothing audible yet) — this speech
+        // is almost always the candidate finishing the sentence that CAUSED
+        // the reply. Cancelling here killed replies before they ever played
+        // (live: "can you repeat it" → text shown, never spoken). Only an
+        // explicit cut-in word cancels pre-audio (Voice_Assist tie guard).
+        if (isCutIn(heard)) {
+          logVoice("barge-in", `pre-audio cut-in: ${heard.slice(0, 40)}`);
+          executeBargeIn();
+        }
       } else {
         // Floor is free: speaking is just answering.
         speechOnsetRef.current = null;
@@ -352,6 +393,7 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
         hideSeq(seq);
         ttsRef.current.enqueue(text, () => {
           speakingMayaTextRef.current = text; // echo filter tracks the LIVE line
+          recentMayaLinesRef.current = [...recentMayaLinesRef.current.slice(-1), text];
           revealSeq(seq);
           dispatchBarge("interviewer_start");
         });
@@ -1187,6 +1229,18 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
             <span className="font-mono text-[var(--rp-ink)]">{phase}</span> · seq{" "}
             <span className="font-mono text-[var(--rp-ink)]">{lastSeq}</span>
           </div>
+          {voiceLog.length > 0 ? (
+            <div>
+              <div className="mb-1 font-mono text-[9px] uppercase tracking-wider">
+                Voice log (also in the browser console as [voice])
+              </div>
+              <div className="max-h-40 overflow-y-auto rounded border border-[var(--rp-edge)] bg-black/20 p-2 font-mono text-[10px] leading-4">
+                {voiceLog.map((line, i) => (
+                  <div key={i}>{line}</div>
+                ))}
+              </div>
+            </div>
+          ) : null}
           {rubric ? (
             <div>
               rubric <span className="font-mono text-[var(--rp-ink)]">{rubric.id}</span> ·{" "}

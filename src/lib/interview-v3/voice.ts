@@ -382,6 +382,91 @@ export function isLikelySpeechEcho(recognized: string, spoken: string): boolean 
   return overlap / heard.length >= 0.72;
 }
 
+// ── fuzzy echo (garble-resistant) ────────────────────────────────────────────
+// STT often GARBLES the speaker echo instead of transcribing it verbatim —
+// observed live: Maya's "Inspect the code in the box" came back as
+// "inspectacled in the park", sailed past the exact-token check above, passed
+// the 3-word barge gate, and CANCELLED HER OWN AUDIO mid-sentence. Character
+// bigrams survive garbling far better than whole words.
+
+function charBigrams(text: string): Map<string, number> {
+  const s = text.toLowerCase().replace(/[^a-z0-9]/g, " ").replace(/\s+/g, " ").trim();
+  const grams = new Map<string, number>();
+  for (let i = 0; i < s.length - 1; i++) {
+    const g = s.slice(i, i + 2);
+    if (g.includes(" ")) continue;
+    grams.set(g, (grams.get(g) ?? 0) + 1);
+  }
+  return grams;
+}
+
+/** Dice coefficient over character bigrams — 0..1, garble-tolerant. */
+export function bigramSimilarity(a: string, b: string): number {
+  const ga = charBigrams(a);
+  const gb = charBigrams(b);
+  let sizeA = 0;
+  let sizeB = 0;
+  let inter = 0;
+  for (const n of ga.values()) sizeA += n;
+  for (const n of gb.values()) sizeB += n;
+  if (sizeA === 0 || sizeB === 0) return 0;
+  for (const [g, n] of ga) inter += Math.min(n, gb.get(g) ?? 0);
+  return (2 * inter) / (sizeA + sizeB);
+}
+
+function normWords(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter((w) => w.length >= 2);
+}
+
+/**
+ * Word-level fuzzy-ORDERED match: what fraction of the heard words appear in
+ * the source line, in the same order, allowing per-word garble (bigram-similar
+ * words count as equal — "inspectacled" ≈ "inspect"). Order is the razor that
+ * separates echo (sequence preserved) from a topical answer that merely reuses
+ * the same vocabulary (reordered → low score). Measured on live data:
+ * garbled echo 0.75–1.0, genuine answers ≤ 0.5.
+ */
+export function orderedEchoScore(recognized: string, spoken: string): number {
+  const heard = normWords(recognized);
+  const src = normWords(spoken);
+  if (heard.length === 0 || src.length === 0) return 0;
+  let prev = new Array<number>(src.length + 1).fill(0);
+  for (let i = 1; i <= heard.length; i++) {
+    const cur = new Array<number>(src.length + 1).fill(0);
+    for (let j = 1; j <= src.length; j++) {
+      const match = heard[i - 1] === src[j - 1] || bigramSimilarity(heard[i - 1], src[j - 1]) >= 0.6;
+      cur[j] = match ? prev[j - 1] + 1 : Math.max(prev[j], cur[j - 1]);
+    }
+    prev = cur;
+  }
+  return prev[src.length] / heard.length;
+}
+
+/**
+ * Garble-resistant echo check against the recently spoken interviewer lines.
+ * ONLY meaningful while (or just after) her audio plays — the caller gates on
+ * that. Note the honest limit: a candidate speaking a verbatim substring of
+ * her line OVER her audio is textually indistinguishable from echo and will
+ * be dropped; cut-in words ("wait", "stop") never resemble her content, so
+ * real interruption always stays available.
+ */
+export function isFuzzyEcho(recognized: string, recentSpoken: readonly string[]): boolean {
+  const heard = (recognized || "").trim();
+  if (heard.length < 8) return false;
+  for (const line of recentSpoken) {
+    if (!line) continue;
+    if (isLikelySpeechEcho(heard, line)) return true;
+    if (orderedEchoScore(heard, line) >= 0.6) return true;
+  }
+  return false;
+}
+
 export function appendFinal(existing: string, chunk: string): string {
   const a = existing.trimEnd();
   const b = chunk.trim();
