@@ -181,11 +181,15 @@ export interface TextToSpeech {
   /** The engine that voiced the most recent turn (honest readiness signal). */
   engine: TtsEngine;
   toggleMute: () => void;
-  /** Speak a line. `onStart` fires the moment AUDIO actually begins (primary,
-   *  cached, or fallback engine) — lets the UI reveal the transcript line in
-   *  sync with the voice instead of seconds before it. Not called when muted
-   *  or when playback never starts (callers should use a failsafe timeout). */
+  /** Speak a line NOW (supersedes anything playing). `onStart` fires the moment
+   *  audio actually begins. Use for one-off/replay; interviewer turns should
+   *  use {@link enqueue} so lines never cut each other off. */
   speak: (text: string, onStart?: () => void) => void;
+  /** Queue a line to play AFTER the current one finishes — serial, race-free.
+   *  This is how interviewer turns are voiced: a reply chased by a nudge both
+   *  play, in order, instead of the second cancelling the first mid-synthesis.
+   *  `onStart` fires when THIS line's audio begins. */
+  enqueue: (text: string, onStart?: () => void) => void;
   replay: () => void;
   cancel: () => void;
   /** Pre-fetch and cache the audio for short lines (latency-masking fillers)
@@ -254,8 +258,18 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
     }
   }, [win]);
 
+  // Serial speak queue (imperative + ref-based, so it never races React state):
+  // interviewer lines play strictly one-at-a-time, in order. speakingRef is the
+  // SYNCHRONOUS "a line is playing" flag (state lags a render behind and caused
+  // the second of two close lines to cancel the first mid-synthesis).
+  const speakingRef = useRef(false);
+  const queueRef = useRef<{ text: string; onStart?: () => void }[]>([]);
+
   const cancel = useCallback(() => {
-    // Invalidate any in-flight synth/playback (barge-in), then stop audio + TTS.
+    // Barge-in / mute: drop the whole queue and invalidate any in-flight
+    // synth/playback, then stop audio + TTS.
+    queueRef.current = [];
+    speakingRef.current = false;
     genRef.current += 1;
     const a = audioRef.current;
     if (a) {
@@ -271,11 +285,12 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
   }, [stopBrowserTts]);
 
   const fallbackSpeak = useCallback(
-    (text: string, gen: number, onStart?: () => void) => {
+    (text: string, gen: number, onStart?: () => void, onEnd?: () => void) => {
       const synth = win?.speechSynthesis;
       const Utterance = win?.SpeechSynthesisUtterance;
       if (!synth || !Utterance) {
         if (gen === genRef.current) setSpeaking(false);
+        onEnd?.();
         return;
       }
       try {
@@ -292,23 +307,38 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
         };
         u.onend = () => {
           if (gen === genRef.current) setSpeaking(false);
+          onEnd?.();
         };
         u.onerror = () => {
           if (gen === genRef.current) setSpeaking(false);
+          onEnd?.();
         };
         synth.speak(u);
       } catch {
         if (gen === genRef.current) setSpeaking(false);
+        onEnd?.();
       }
     },
     [win],
   );
 
   const speakText = useCallback(
-    async (text: string, onStart?: () => void) => {
+    async (text: string, onStart?: () => void, onEnd?: () => void) => {
+      // onEnd fires EXACTLY once when this line finishes, fails, or is
+      // superseded — it's what advances the serial queue (and resets
+      // speakingRef), so it must fire on every exit path.
+      let ended = false;
+      const finish = () => {
+        if (ended) return;
+        ended = true;
+        onEnd?.();
+      };
       // Sanitize code-ish tokens so the voice pronounces words naturally.
       const clean = sanitizeForSpeech(text);
-      if (!clean || !win) return;
+      if (!clean || !win) {
+        finish();
+        return;
+      }
 
       // New generation: supersede anything currently playing/synthesizing.
       const gen = (genRef.current += 1);
@@ -347,21 +377,27 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
         audio.muted = false;
         audio.volume = INTERVIEWER_AUDIO_VOLUME;
         audioRef.current = audio;
-        const finish = () => {
+        const done = () => {
           if (gen === genRef.current) setSpeaking(false);
           revoke?.(url);
+          finish();
         };
-        audio.onended = finish;
-        audio.onerror = finish;
+        audio.onended = done;
+        audio.onerror = done;
         try {
           await audio.play();
           if (gen === genRef.current) {
             setEngine("sia");
             onStart?.();
+          } else {
+            done(); // superseded during the play() promise
           }
-          return;
+          return; // audio still playing — `done` fires when it ends
         } catch {
-          if (gen !== genRef.current) return; // canceled mid-play
+          if (gen !== genRef.current) {
+            finish();
+            return; // canceled mid-play
+          }
           // fall through to the normal path
         }
       }
@@ -374,42 +410,69 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ text: clean }),
           });
-          if (gen !== genRef.current) return; // barged-in while awaiting
+          if (gen !== genRef.current) {
+            finish();
+            return; // barged-in while awaiting
+          }
           if (res.ok) {
             const blob = await res.blob();
-            if (gen !== genRef.current) return;
+            if (gen !== genRef.current) {
+              finish();
+              return;
+            }
             const url = makeUrl(blob);
             const audio = audioFactory(url);
             audio.muted = false;
             audio.volume = INTERVIEWER_AUDIO_VOLUME; // softer interviewer playback
             audioRef.current = audio;
-            const finish = () => {
+            const done = () => {
               if (gen === genRef.current) setSpeaking(false);
               revoke?.(url);
+              finish();
             };
-            audio.onended = finish;
-            audio.onerror = finish;
+            audio.onended = done;
+            audio.onerror = done;
             await audio.play();
             if (gen === genRef.current) {
               setEngine("sia"); // real ElevenLabs voice
               onStart?.();
+            } else {
+              done();
             }
-            return;
+            return; // `done` fires when the audio ends
           }
           // Non-OK (e.g. 503 no key) → fall through to browser TTS.
         } catch {
-          if (gen !== genRef.current) return; // canceled, not a real failure
+          if (gen !== genRef.current) {
+            finish();
+            return; // canceled, not a real failure
+          }
         }
       }
 
-      if (gen !== genRef.current) return;
-      fallbackSpeak(clean, gen, onStart);
+      if (gen !== genRef.current) {
+        finish();
+        return;
+      }
+      fallbackSpeak(clean, gen, onStart, finish);
     },
     [win, endpoint, stopBrowserTts, fallbackSpeak],
   );
 
-  // Speak only if not muted; ALWAYS remember the last text so unmute + replay
-  // works even for turns that arrived while muted.
+  // Serial pump: play the next queued line only when the current one has fully
+  // finished (speakingRef, set/cleared synchronously — no React-state race).
+  const pump = useCallback(() => {
+    if (speakingRef.current) return;
+    const next = queueRef.current.shift();
+    if (!next) return;
+    speakingRef.current = true;
+    void speakText(next.text, next.onStart, () => {
+      speakingRef.current = false;
+      pump();
+    });
+  }, [speakText]);
+
+  // Speak NOW, superseding the queue+current line (one-off / replay / filler).
   const speak = useCallback(
     (text: string, onStart?: () => void) => {
       const clean = text.trim();
@@ -419,6 +482,19 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
       void speakText(clean, onStart);
     },
     [muted, speakText],
+  );
+
+  // Queue a line to play after the current one — the interviewer-turn path.
+  const enqueue = useCallback(
+    (text: string, onStart?: () => void) => {
+      const clean = text.trim();
+      if (!clean) return;
+      lastTextRef.current = clean;
+      if (muted) return;
+      queueRef.current.push({ text: clean, onStart });
+      pump();
+    },
+    [muted, pump],
   );
 
   const replay = useCallback(() => {
@@ -465,5 +541,5 @@ export function useTextToSpeech(opts: UseTextToSpeechOptions = {}): TextToSpeech
   // Cancel speech on unmount.
   useEffect(() => () => cancel(), [cancel]);
 
-  return { supported, muted, speaking, engine, toggleMute, speak, replay, cancel, prime };
+  return { supported, muted, speaking, engine, toggleMute, speak, enqueue, replay, cancel, prime };
 }

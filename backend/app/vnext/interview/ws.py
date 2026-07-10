@@ -80,11 +80,12 @@ _CLASSIFIER = get_classifier()
 # (never a hint — hints are earned via the help ladder), then one check-in.
 # Constants are module-level so tests can shrink them.
 _SILENCE_POLL_SECS = 5.0
-# Tuned from live runs: 25s nudged candidates who were genuinely thinking
-# ("can you give me a minute") and made Maya feel naggy. Real interviewers
-# hold longer silences than feels comfortable.
-_SILENCE_FIRST_SECS = 45.0
-_SILENCE_SECOND_SECS = 90.0
+# Tuned from live runs: shorter thresholds nudged candidates who were genuinely
+# thinking ("can you give me a minute") and made Maya feel naggy. The client
+# also sends a candidate.speaking heartbeat (VAD-style, from STT interims) that
+# resets this timer, so a nudge only fires on TRUE silence — no mic activity.
+_SILENCE_FIRST_SECS = 60.0
+_SILENCE_SECOND_SECS = 120.0
 _SILENCE_NUDGES = (
     "Talk me through what you're thinking — half-formed is fine.",
     "Still with me? Say what you're weighing, or tell me if you'd like the question rephrased.",
@@ -667,9 +668,9 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
             mtype = msg.get("type")
 
             # Transport keepalive: keeps the socket warm through proxies that
-            # kill idle WebSockets. Deliberately NOT candidate activity — a
-            # 25s ping heartbeat would otherwise permanently suppress the
-            # silence nudges (whose first threshold is ~25s).
+            # kill idle WebSockets. Deliberately NOT candidate activity — the
+            # ping heartbeat would otherwise permanently suppress the silence
+            # nudges.
             if mtype == "ping":
                 continue
 
@@ -677,6 +678,13 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
             # ladder resets and a fresh episode begins.
             activity["candidate"] = time.monotonic()
             nudge_state["level"] = 0
+
+            # VAD heartbeat (STT interim on the client): the candidate is
+            # actively speaking — reset the timer above but do NOTHING else (no
+            # transcript, no turn). This is what keeps nudges from firing while
+            # they think out loud.
+            if mtype == "candidate.speaking":
+                continue
 
             if mtype == "advance.request":
                 signal = str(msg.get("signal", ""))

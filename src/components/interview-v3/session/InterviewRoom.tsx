@@ -30,12 +30,7 @@ import {
   nextBargeState,
   type BargeState,
 } from "@/lib/interview-v3/voice";
-import {
-  FILLER_LINES,
-  decideBargeIn,
-  decideTurnEnd,
-  pickFiller,
-} from "@/lib/interview-v3/turn-taking";
+import { decideBargeIn, decideTurnEnd } from "@/lib/interview-v3/turn-taking";
 import {
   INCIDENT_SEED_CODE,
   INCIDENT_TASK_PROMPT,
@@ -177,13 +172,14 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
   // episode; re-armed when a new turn starts speaking.
   const speechOnsetRef = useRef<number | null>(null);
   const bargedThisTurnRef = useRef(false);
+  const lastSpeakingPingRef = useRef(0);
 
   const executeBargeIn = () => {
     if (bargedThisTurnRef.current) return;
     bargedThisTurnRef.current = true;
     dispatchBarge("speech_start");
-    ttsRef.current.cancel(); // stop interviewer audio immediately (client)
-    clearSpeakQueue(); // queued-but-unspoken lines yield too (their text reveals)
+    ttsRef.current.cancel(); // stop interviewer audio + clear the queue (client)
+    revealAllHidden(); // any queued-but-unspoken lines: show their text now
     suppressSpeakRef.current = true; // an in-flight / just-arrived turn won't auto-speak
     // Tell the backend to cancel the in-flight interviewer generation so its
     // late LLM output never streams back as the active question.
@@ -231,6 +227,15 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
       if (sendTimerRef.current) {
         window.clearTimeout(sendTimerRef.current);
         sendTimerRef.current = null;
+      }
+      // VAD-style voice-activity signal (browser STT interims are our VAD):
+      // tell the server the candidate is actively speaking so its silence
+      // nudges don't fire while they think out loud. Throttled to ~3s; the
+      // server treats it as activity only (no transcript, no turn).
+      const now = Date.now();
+      if (now - lastSpeakingPingRef.current > 3000) {
+        lastSpeakingPingRef.current = now;
+        adapterRef.current?.notifySpeaking?.();
       }
       if (ttsRef.current.speaking) {
         if (speechOnsetRef.current === null) speechOnsetRef.current = Date.now();
@@ -298,17 +303,15 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tts.speaking]);
 
-  // ── speak QUEUE (mute honored inside speak()) ─────────────────────────────
-  // Interviewer lines can arrive in quick succession (a reactive reply chased
-  // by a silence nudge). Newest-wins superseded the first line's audio mid-
-  // synthesis — text appeared but was never heard (observed live). Every
-  // unspoken line is queued and spoken IN ORDER; a barge-in clears the queue.
+  // ── voicing interviewer turns ─────────────────────────────────────────────
+  // Lines are handed to the TTS hook's SERIAL QUEUE (tts.enqueue): a reactive
+  // reply chased by a silence nudge both play, in order — the second never
+  // cancels the first mid-synthesis (that race dropped audio live).
   //
-  // VOICE/TEXT SYNC: each queued line stays HIDDEN from the transcript until
-  // its audio actually starts (speak()'s onStart), with a failsafe reveal so
-  // text can never be lost if playback fails or is muted mid-flight.
+  // VOICE/TEXT SYNC: each line stays HIDDEN from the transcript until ITS audio
+  // starts (enqueue's onStart), with a failsafe reveal so text is never lost if
+  // playback fails or is muted mid-flight.
   const enqueuedSeqRef = useRef(-1);
-  const speakQueueRef = useRef<{ seq: number; text: string; turnId?: string }[]>([]);
   const [hiddenSeqs, setHiddenSeqs] = useState<number[]>([]);
   const revealTimersRef = useRef(new Map<number, number>());
   const revealSeq = (seq: number) => {
@@ -317,22 +320,15 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
     revealTimersRef.current.delete(seq);
     setHiddenSeqs((h) => h.filter((s) => s !== seq));
   };
+  const revealAllHidden = () => {
+    for (const t of revealTimersRef.current.values()) window.clearTimeout(t);
+    revealTimersRef.current.clear();
+    setHiddenSeqs([]);
+  };
   const hideSeq = (seq: number) => {
     setHiddenSeqs((h) => (h.includes(seq) ? h : [...h, seq]));
-    const t = window.setTimeout(() => revealSeq(seq), 8000);
+    const t = window.setTimeout(() => revealSeq(seq), 6000);
     revealTimersRef.current.set(seq, t);
-  };
-  const clearSpeakQueue = () => {
-    for (const item of speakQueueRef.current) revealSeq(item.seq);
-    speakQueueRef.current = [];
-  };
-  const pumpSpeakQueue = () => {
-    if (ttsRef.current.speaking) return; // next line starts when this one ends
-    const next = speakQueueRef.current.shift();
-    if (!next) return;
-    speakingMayaTextRef.current = next.text;
-    ttsRef.current.speak(next.text, () => revealSeq(next.seq));
-    dispatchBarge("interviewer_start");
   };
   useEffect(() => {
     const src = isLlm ? llmLedger : [...revealed, ...liveExtra];
@@ -350,52 +346,26 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
         continue;
       }
       if (e.turnId && cancelled.has(e.turnId)) continue;
-      if (tts.supported && !tts.muted) hideSeq(e.seq);
-      speakQueueRef.current.push({ seq: e.seq, text: e.text, turnId: e.turnId });
+      const seq = e.seq;
+      const text = e.text;
+      if (tts.supported && !tts.muted) {
+        hideSeq(seq);
+        ttsRef.current.enqueue(text, () => {
+          speakingMayaTextRef.current = text; // echo filter tracks the LIVE line
+          revealSeq(seq);
+          dispatchBarge("interviewer_start");
+        });
+      } else {
+        ttsRef.current.enqueue(text);
+      }
     }
-    pumpSpeakQueue();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLlm, llmLedger, revealed, liveExtra]);
 
-  // When one line finishes, the next queued line speaks.
-  useEffect(() => {
-    if (!tts.speaking) pumpSpeakQueue();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tts.speaking]);
-
-  // ── latency masking ────────────────────────────────────────────────────────
-  // The moment a turn STARTS generating (interviewer.turn.started arrives
-  // synchronously, before the LLM+TTS round-trip), speak a short pre-cached
-  // filler ("Hm.", "Right, let me think.") so the room never sits in dead air.
-  // The real utterance supersedes it via the TTS generation counter; a barge-in
-  // cancels it like any other speech.
-  useEffect(() => {
-    if (isLlm && ready) ttsRef.current.prime(FILLER_LINES);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isLlm, ready]);
-  const fillerSeqRef = useRef(-1);
-  useEffect(() => {
-    if (!isLlm) return;
-    let started: { seq: number } | null = null;
-    let answered = false;
-    for (let i = llmLedger.length - 1; i >= 0; i--) {
-      const e = llmLedger[i];
-      if (e.type === "interviewer.utterance") {
-        answered = true; // newest activity is already a spoken line
-        break;
-      }
-      if (e.type === "interviewer.turn.started") {
-        started = { seq: e.seq };
-        break;
-      }
-    }
-    if (!started || answered || started.seq === fillerSeqRef.current) return;
-    fillerSeqRef.current = started.seq;
-    if (suppressSpeakRef.current || ttsRef.current.speaking) return;
-    const filler = pickFiller(started.seq);
-    speakingMayaTextRef.current = filler; // echo filter must cover the filler too
-    ttsRef.current.speak(filler);
-  }, [isLlm, llmLedger]);
+  // (Latency-masking fillers were removed: a separate speak() competed with the
+  // serial queue and could cut a real line short. The turn.started event still
+  // drives the "Maya is thinking" UI; dead air is covered by the queue starting
+  // the real line as soon as its audio is ready.)
 
   // Keep the transcript pinned to the latest line.
   useEffect(() => {

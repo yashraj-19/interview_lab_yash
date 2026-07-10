@@ -309,6 +309,12 @@ export class LiveInterviewAdapter implements InterviewAdapter {
     this.sendFrame(turnId ? { type: "barge_in", turnId } : { type: "barge_in" });
   }
 
+  notifySpeaking(): void {
+    // Activity-only heartbeat (throttled by the room); resets the server's
+    // silence timer so nudges don't fire while the candidate thinks aloud.
+    this.sendFrame({ type: "candidate.speaking" });
+  }
+
   acceptPatch(patchId: string): void {
     this.sendFrame({ type: "code.patch.accept", patchId });
   }

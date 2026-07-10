@@ -51,6 +51,11 @@ export interface InterviewAdapter {
    */
   bargeIn(turnId?: string): void;
 
+  /** VAD-style heartbeat: the candidate is actively speaking (STT interim).
+   * Resets the server's silence timer so nudges don't fire mid-thought.
+   * Best-effort, throttled by the caller, no transcript. Optional; mock no-ops. */
+  notifySpeaking?(): void;
+
   /** Candidate accepts a Maya-proposed code patch. The server applies it
    *  (emits code.patch.applied + authoritative code.edited); the UI never mints
    *  code. No-op in the mock. */

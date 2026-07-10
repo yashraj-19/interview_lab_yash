@@ -128,12 +128,15 @@ describe("useSpeechToText", () => {
 
 interface FakeAudio {
   muted: boolean;
+  volume: number;
   onended: (() => void) | null;
   onerror: (() => void) | null;
   played: boolean;
   paused: boolean;
   play: () => Promise<void>;
   pause: () => void;
+  /** Test helper: fire the natural end-of-playback. */
+  end: () => void;
 }
 
 function ttsHarness(over: { fetchOk?: boolean } = {}) {
@@ -151,6 +154,7 @@ function ttsHarness(over: { fetchOk?: boolean } = {}) {
   const audioFactory = (): FakeAudio => {
     const a: FakeAudio = {
       muted: false,
+      volume: 1,
       onended: null,
       onerror: null,
       played: false,
@@ -161,6 +165,7 @@ function ttsHarness(over: { fetchOk?: boolean } = {}) {
       pause: () => {
         a.paused = true;
       },
+      end: () => a.onended?.(),
     };
     audios.push(a);
     return a;
@@ -210,6 +215,59 @@ describe("useTextToSpeech", () => {
     expect(h.spoken).toHaveLength(1); // browser TTS used instead
     expect(h.spoken[0].text).toBe("fallback please");
     expect(result.current.engine).toBe("fallback"); // honest readiness signal
+  });
+
+  it("enqueue plays lines SERIALLY — a second line never cuts off the first", async () => {
+    // The exact live bug: a reactive reply chased by a silence nudge. Newest-
+    // wins cancelled the first mid-synthesis (text shown, no voice). The queue
+    // must play BOTH, in order.
+    const h = ttsHarness();
+    const started: string[] = [];
+    const { result } = renderHook(() => useTextToSpeech(h.opts));
+
+    await act(async () => {
+      result.current.enqueue("First line, the real reply.", () => started.push("first"));
+      result.current.enqueue("Second line, the silence nudge.", () => started.push("second"));
+    });
+
+    // Only the FIRST line has synthesized/played so far — the second waits.
+    expect(h.fetchCalls.map((c) => (c.body as { text: string }).text)).toEqual([
+      "First line, the real reply.",
+    ]);
+    expect(h.audios).toHaveLength(1);
+    expect(h.audios[0].played).toBe(true);
+    expect(started).toEqual(["first"]);
+
+    // First line finishes → the second is synthesized and played (not dropped).
+    await act(async () => {
+      h.audios[0].end();
+    });
+    expect(h.fetchCalls).toHaveLength(2);
+    expect((h.fetchCalls[1].body as { text: string }).text).toBe("Second line, the silence nudge.");
+    expect(h.audios).toHaveLength(2);
+    expect(h.audios[1].played).toBe(true);
+    expect(started).toEqual(["first", "second"]);
+  });
+
+  it("cancel() clears the queue so a barge-in drops pending lines", async () => {
+    const h = ttsHarness();
+    const { result } = renderHook(() => useTextToSpeech(h.opts));
+
+    await act(async () => {
+      result.current.enqueue("first");
+      result.current.enqueue("second");
+    });
+    expect(h.audios).toHaveLength(1); // first playing, second queued
+
+    await act(async () => {
+      result.current.cancel(); // barge-in
+    });
+    // Ending the (now-cancelled) first audio must NOT start the queued second.
+    await act(async () => {
+      h.audios[0].end();
+    });
+    expect(h.fetchCalls).toHaveLength(1); // second never synthesized
+    expect(h.audios).toHaveLength(1);
   });
 
   it("muting suppresses speech but replay works after unmute", async () => {
