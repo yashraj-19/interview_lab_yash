@@ -161,6 +161,12 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
     setVoiceLog((l) => [...l.slice(-39), line]);
   };
   const tts = useTextToSpeech({ onVoiceEvent: logVoice });
+  // Build marker: the FIRST voice-log line names the guard generation, so a
+  // live test can instantly confirm which build it's running against.
+  useEffect(() => {
+    logVoice("init", "voice-guard v3 (serial queue + ordered echo shield + tie guard + discard rule)");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const ttsRef = useRef(tts);
   // Keep "latest value" refs current without mutating during render.
   useEffect(() => {
@@ -211,6 +217,18 @@ export function InterviewRoom({ sessionId }: { sessionId: string }) {
 
   const stt = useSpeechToText({
     onFinalTranscript: (chunk) => {
+      // STRUCTURAL echo defense (Voice_Assist "interrupt or discard"): speech
+      // finalized while Maya's audio is playing (or its 1.5s tail) that did NOT
+      // trigger a real barge-in can only be her own echo or a backchannel —
+      // never let it become answer text (live: a garbled echo of her opening
+      // was sent to the server as the candidate's "answer").
+      const nearHerAudio =
+        ttsRef.current.isAudioPlaying() ||
+        Date.now() - ttsRef.current.lastAudioEndedAt() < 1500;
+      if (nearHerAudio && !bargedThisTurnRef.current) {
+        logVoice("chunk-discarded", `during her speech: ${chunk.slice(0, 48)}`);
+        return;
+      }
       const merged = appendFinal(answerRef.current, chunk);
       setAnswer(merged);
       dispatchBarge("final");

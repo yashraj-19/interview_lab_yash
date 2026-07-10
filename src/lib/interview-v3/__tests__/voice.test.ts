@@ -260,9 +260,10 @@ describe("isFuzzyEcho — garble-resistant speaker-echo detection", () => {
   const MAYA =
     "Inspect the code in the box and identify why it sometimes creates duplicate charges on retry.";
 
-  it("catches the EXACT live garble that made Maya cancel herself", () => {
-    // Observed in production: her opening line came back from the mic as this.
+  it("catches the EXACT live garbles that made Maya cancel herself", () => {
+    // Observed in production: her opening line came back from the mic as these.
     expect(isFuzzyEcho("inspectacled in the park", [MAYA])).toBe(true);
+    expect(isFuzzyEcho("inspector in the park", [MAYA])).toBe(true);
   });
 
   it("catches verbatim echo and partial leading echo", () => {
