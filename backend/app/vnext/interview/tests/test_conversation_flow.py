@@ -125,7 +125,7 @@ def _conv_chat(reply="Which part feels unfamiliar — the retry logic or the con
             return json.dumps({"intent": intent, "reply": reply, "advance": advance,
                                "covered": ["topic"], "note": "n"})
         if "Maya" in text:
-            return json.dumps({"utterance": "Let's start — walk me through the charge API."})
+            return json.dumps({"utterance": "Let's start — walk me through the charge API?"})
         return json.dumps({"criteria": [
             {"id": "c1", "name": "Correctness", "description": "d", "weight": 100,
              "signals": ["a"], "phaseHints": ["coding"]}]})

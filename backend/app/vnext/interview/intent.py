@@ -76,13 +76,16 @@ class RuleBasedIntentClassifier:
         # Repeat must be an explicit request — a bare "again" matches ordinary
         # answers ("a retry could charge AGAIN") and misroutes them to the
         # repeat path (observed live), so only repeat-shaped phrases count.
+        # "didn't get/catch you" means REPEAT THE QUESTION, not an audio check
+        # (observed live: it got "I can hear you" instead of the question).
         self._repeat_rx = re.compile(
-            r"\b(repeat|rephrase|say (that|it) again|once more|come again|one more time)\b",
+            r"\b(repeat|rephrase|say (that|it) again|once more|come again|one more time"
+            r"|did(n'?t| not) (get|catch|hear) (you|that|it))\b",
             re.IGNORECASE,
         )
         self._help_rx = re.compile(r"\b(stuck|guide me|hint|confused|lost|don't get it|dont get it|need help|not sure|help me|can you help|help with|give me a hand)\b", re.IGNORECASE)
         self._thinking_rx = re.compile(r"\b(let me think|give me a sec|give me a second|give me some time|hold on|one moment|thinking|think)\b", re.IGNORECASE)
-        self._meta_audio_rx = re.compile(r"\b(hear me|can you hear me|didn't get you|didnt get you|hello|hi|hey)\b", re.IGNORECASE)
+        self._meta_audio_rx = re.compile(r"\b(hear me|can you hear me|am i audible|hello|hi|hey)\b", re.IGNORECASE)
 
     def is_backchannel(self, text: str) -> bool:
         """True if the text is a pure backchannel (no intent to be handled)."""

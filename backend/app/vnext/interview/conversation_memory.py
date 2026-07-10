@@ -94,8 +94,19 @@ def build_memory(events: list[dict], current_phase: str) -> ConversationMemory:
                 mem.has_run = True
         elif t == "interviewer.utterance":
             text = str(e.get("text", "")).strip()
-            if text and not e.get("hint_for") and not e.get("nudgeLevel"):
+            # last_question: what "can you repeat?" restates — never a hint,
+            # nudge, previous restatement, or short acknowledgment ("I can hear
+            # you. Go ahead." became the "question" in a live run). Prefer lines
+            # that actually ask/instruct something substantial.
+            if (
+                text
+                and not e.get("hint_for")
+                and not e.get("nudgeLevel")
+                and not e.get("restated")
+                and ("?" in text or len(text) > 60)
+            ):
                 mem.last_question = text
+            if text and not e.get("hint_for") and not e.get("nudgeLevel"):
                 op = _opener(text)
                 if op:
                     mem.prior_openers.append(op)

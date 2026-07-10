@@ -47,6 +47,7 @@ from .session_init import SessionInitManager
 from .hint_provider import get_hint_for
 from .pause_policy import get_pause_for
 from .reveal_guard import guard_interviewer_line
+from .echo_shield import is_probable_echo
 
 router = APIRouter()
 
@@ -776,6 +777,18 @@ async def vnext_interview_ws(websocket: WebSocket, session_id: str) -> None:
                             await send(session_init.mark_ready())
                     if session_init.is_complete():
                         onboarding_done = True
+                    continue
+
+                # SERVER-SIDE ECHO BACKSTOP: if this "candidate" text is a
+                # (garbled) echo of a line Maya JUST spoke, refuse it — no
+                # transcript entry, no reply. The client shields echo too, but a
+                # stale tab running an old bundle forwarded her own speaker
+                # output as an answer live ("sometimes create") and she answered
+                # herself. The server knows every line she spoke; this holds
+                # regardless of client version.
+                if is_probable_echo(text_str, STORE.get_events(session_id, 0)):
+                    await send(_emit(session_id, "system", "echo.dropped",
+                                     {"text": text_str[:120]}))
                     continue
 
                 # Classify ONCE; the same intent is passed into

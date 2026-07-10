@@ -97,7 +97,10 @@ def deterministic_turn(session_id: str, category: str, text: str) -> list[dict]:
         last_q = mem.last_question or "Let's focus on the current task — talk me through your approach."
         out.append(STORE.append_event(
             session_id, "interviewer", "interviewer.utterance",
-            {"lineId": f"dir-{seq}", "text": f"Sure — {last_q}"},
+            # `restated` keeps this line out of conversation memory's
+            # last_question, so a second "repeat?" restates the QUESTION again
+            # rather than compounding "Sure — Sure — …".
+            {"lineId": f"dir-{seq}", "text": f"Sure — {last_q}", "restated": True},
         ))
         return out
 

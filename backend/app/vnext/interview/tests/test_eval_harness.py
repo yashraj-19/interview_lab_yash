@@ -97,7 +97,10 @@ class TestIntentClassification:
     def test_repeat_intent(self, classifier):
         """Repeat: explicit repeat-shaped requests only."""
         repeat_phrases = ["repeat", "rephrase", "say that again", "can you repeat",
-                          "once more", "one more time please"]
+                          "once more", "one more time please",
+                          # "didn't get you" = repeat the question, NOT an audio
+                          # check (live: it got "I can hear you" instead).
+                          "I didn't get you", "didn't catch that"]
         for phrase in repeat_phrases:
             assert classifier.classify(phrase) == "repeat", f"'{phrase}' should be repeat"
         # A bare "again" inside an ANSWER must not misroute to repeat (observed
@@ -112,7 +115,7 @@ class TestIntentClassification:
 
     def test_meta_audio_intent(self, classifier):
         """Meta audio: connectivity check."""
-        audio_phrases = ["hear me", "can you hear me", "didn't get you", "hello", "hi", "hey there"]
+        audio_phrases = ["hear me", "can you hear me", "am i audible", "hello", "hi", "hey there"]
         for phrase in audio_phrases:
             result = classifier.classify(phrase)
             assert result == "meta_audio", f"'{phrase}' should be meta_audio, got {result}"
